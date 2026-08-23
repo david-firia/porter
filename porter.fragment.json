@@ -1,0 +1,13 @@
+{
+    "$help": "Copy to %LOCALAPPDATA%\\Microsoft\\Windows Terminal\\Fragments\\porter\\porter.json",
+    "profiles": [
+        {
+            "name": "porter (serial)",
+            "commandline": "porter",
+            "startingDirectory": "%USERPROFILE%",
+            "icon": "\ud83d\udd0c",
+            "closeOnExit": "always",
+            "historySize": 20000
+        }
+    ]
+}

@@ -1,0 +1,17 @@
+[project]
+name = "porter-serial"
+version = "0.1.0"
+description = "Serial terminal with a live device picker"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+porter = "porter:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["porter"]
