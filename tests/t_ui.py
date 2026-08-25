@@ -117,6 +117,33 @@ send("a"); expect("prompt again", r"name for this device:")
 send("\x1b"); expect("prompt cancelled", r"cancelled")
 record("still in picker after cancel", proc.poll() is None)
 
+print("high contrast")
+CUR[0] = len(buf)
+send("H")
+# set_theme writes the OSC before the picker redraws with the new message.
+expect("terminal told the new background", r"\x1b\]11;#000000\x07")
+expect("picker reports the theme", r"theme: contrast-dark")
+
+send("\x1b"); expect("back in the session", r"back on")
+CUR[0] = len(buf)
+os.write(dev, b"\x1b[31mSCARLET\x1b[0m\r\n"); pump(0.5)
+i = bytes(buf).find(b"SCARLET", CUR[0])
+record("device colour flattened in high contrast",
+       i > 0 and b"\x1b[31m" not in bytes(buf)[CUR[0]:i], f"at {i}")
+
+CUR[0] = len(buf)
+send(b"\x14H"); expect("cycles to the light theme", r"theme: contrast-light")
+send(b"\x14H")
+expect("terminal colours handed back", r"\x1b\]110\x07\x1b\]111\x07")
+expect("cycles back to default", r"theme: default")
+CUR[0] = len(buf)
+os.write(dev, b"\x1b[31mCRIMSON\x1b[0m\r\n"); pump(0.5)
+j = bytes(buf).find(b"CRIMSON", CUR[0])
+record("device colour restored under the default theme",
+       j > 0 and b"\x1b[31m" in bytes(buf)[CUR[0]:j], f"at {j}")
+
+send(b"\x14d"); expect("picker for exit", r"q quit")
+
 send("q")
 try: rc = proc.wait(timeout=8)
 except subprocess.TimeoutExpired: proc.kill(); rc = "HUNG"

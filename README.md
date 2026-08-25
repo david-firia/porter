@@ -21,13 +21,33 @@ somewhere permanent — moving or deleting it breaks the command.**
 
 ### Windows
 
-Install uv if you do not have it, then open a new terminal:
+Install uv if you do not have it, then **open a new terminal**:
 
 ```powershell
 winget install --id=astral-sh.uv -e
 ```
 
-Install porter from the folder holding `porter.py` and `pyproject.toml`:
+Then run the installer from the folder holding `porter.py`:
+
+```powershell
+cd C:\path\to\porter
+.\install.ps1
+```
+
+Double-clicking `install.cmd` does the same thing without arguing with your
+PowerShell execution policy. Either way it installs the command, puts it on PATH,
+registers the Windows Terminal profile, warns about the `.PY`-on-PATH trap below,
+and runs `porter --list` to prove it worked.
+
+| Switch | |
+|---|---|
+| `-SkipTerminalProfile` | install the command only, leave the dropdown alone |
+| `-AllUsers` | register the terminal profile machine-wide; needs an elevated prompt |
+| `-Uninstall` | remove both the command and the profile |
+
+**Restart the terminal afterwards** — PATH is read at process start.
+
+#### By hand
 
 ```powershell
 cd C:\path\to\porter
@@ -35,8 +55,8 @@ uv tool install --editable .
 uv tool update-shell
 ```
 
-`update-shell` adds `%USERPROFILE%\.local\bin` to your user PATH. **Restart the
-terminal** — PATH is read at process start — then verify:
+`update-shell` adds `%USERPROFILE%\.local\bin` to your user PATH. Restart the
+terminal, then verify:
 
 ```powershell
 Get-Command porter        # want: Application, ...\.local\bin\porter.exe
@@ -137,7 +157,8 @@ recognised across replugs even when Windows renumbers it.
  > 1  codebot-3              COM14          239a:80f4   115200  +new
    2  jlink-uart             COM7           1366:1051   460800
 
- j/k or arrows select  .  enter connect  .  1-9 jump  .  b baud  .  a alias  .  q quit
+ j/k or arrows select  .  enter connect  .  1-9 jump  .  b baud  .  a name
+ H high contrast  .  q quit
 ```
 
 - Polls every 400ms. A device that **just appeared** is tagged `+new` and the selection
@@ -151,6 +172,7 @@ recognised across replugs even when Windows renumbers it.
   picker is up, so resuming cannot reset your board, and device output that arrives
   meanwhile is buffered and flushed when you return. With no session behind it, `esc`
   exits. `q` always exits.
+- `H` cycles the high-contrast themes, same key as in a session.
 - Ports with no USB vid:pid (motherboard COM1/COM2, Bluetooth SPP, virtual sniffer
   bridges) are hidden. `--all` or `show_all = true` reveals them, and any port you have
   explicitly aliased is always shown — that is how you keep a real RS-232 port in the
@@ -159,7 +181,7 @@ recognised across replugs even when Windows renumbers it.
 ## In-session keys
 
 Borrowed from [tio](https://github.com/tio/tio), so muscle memory transfers both ways.
-`d` and `n` are additions — tio leaves them unused.
+`d`, `n` and `H` are additions, on keys tio leaves unused.
 
 | Key | Action | | Key | Action |
 |---|---|---|---|---|
@@ -168,10 +190,35 @@ Borrowed from [tio](https://github.com/tio/tio), so muscle memory transfers both
 | `ctrl-t d` | **back to device picker** | | `ctrl-t g` | toggle DTR/RTS |
 | `ctrl-t n` | **next device** | | `ctrl-t b` | send break |
 | `ctrl-t l` | clear screen | | `ctrl-t e` | toggle local echo |
-| `ctrl-t ctrl-t` | send a literal ctrl-t | | | |
+| `ctrl-t H` | **high-contrast mode** | | `ctrl-t ctrl-t` | send a literal ctrl-t |
 
 Everything else reaches the device untouched — including `ctrl-c`, which matters when
 you are talking to a CircuitPython REPL.
+
+## High contrast
+
+Sunlight eats the default palette: dim greys vanish, and mid-tone colours stop being
+distinguishable from each other or from the background. `H` — in the picker or as
+`ctrl-t H` in a session — cycles
+
+    default  ->  contrast-dark  ->  contrast-light  ->  default
+
+`contrast-dark` is bright white on black, `contrast-light` is black on white. Pick
+whichever wins against the glare you actually have; on most laptop panels that is the
+light one outdoors and the dark one in the shade.
+
+Both spend every distinction the default palette makes on legibility instead: no dim
+text, no colour coding, just bold and reverse video for the selection and for anything
+that needs to stand out. **Colour in the device's own output is flattened too** — an
+ANSI-coloured REPL prompt would otherwise paint its own unreadable grey straight over
+the top. Cursor movement and screen clears still pass through, so a full-screen program
+on the far end keeps working; it just arrives monochrome.
+
+The switch is sent to the terminal as OSC 10/11, so the scrollback already on screen
+repaints as well, and the terminal's own colours are handed back on exit.
+
+Set `theme = contrast-dark` under `[porter]` to start that way — useful when you
+already know you are heading outside.
 
 ## Config
 
@@ -183,6 +230,7 @@ or `$PORTER_CONFIG`). Written with commented examples on first run.
 baudrate = 115200
 show_all = false                   ; show ports with no USB id
 exclude = COM1, *Bluetooth*, /dev/ttyS*
+theme = default                    ; or contrast-dark / contrast-light
 
 [codebot-3]
 id = 239a:80f4:DF6202B3184E3033   ; one specific board
@@ -199,8 +247,33 @@ Run `porter --list` to see the ids of what is currently plugged in.
 
 ## Windows Terminal
 
-`porter.fragment.json` registers porter as a profile in the dropdown. Fix the path,
-then drop it at `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\porter\porter.json`.
+`.\install.ps1` puts porter in the new-tab dropdown for you. Restart Windows Terminal
+and "porter (serial)" is there.
+
+What it does, if you would rather do it yourself: Windows Terminal reads extra
+profiles from **fragment extensions** — JSON files that third-party apps (Git Bash,
+Anaconda, vendor toolchains) drop into a well-known folder. It picks them up at
+startup; you never edit `settings.json`.
+
+| For | Put the file in |
+|---|---|
+| just you | `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\porter\porter.json` |
+| every user | `%ProgramFiles%\Microsoft\Windows Terminal\Fragments\porter\porter.json` |
+
+Two things make this hard to find the first time:
+
+- **None of those folders exist until something creates them.** Create the whole
+  chain, including `Fragments\porter\`. The last component is an app name of your
+  choosing and just keeps your file away from everyone else's.
+- **It is not where `settings.json` lives.** That is
+  `%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\`,
+  which has nothing to do with fragments. The `Fragments` tree sits directly under
+  `%LOCALAPPDATA%\Microsoft\`, and holds for a Store-installed Windows Terminal too.
+
+Copy `porter.fragment.json` there as `porter.json`, drop the `$help` key, and set
+`commandline` to the full quoted path of `porter.exe` (`uv tool dir --bin` prints the
+directory). A bare `porter` works too, but only once PATH has caught up — which it has
+not if Windows Terminal was already running when you installed.
 
 ## Troubleshooting
 
@@ -212,14 +285,15 @@ main thread has nothing left to report with:
 
 ## Tests
 
-- `tests/t_unit.py` -- identity, alias matching, baud precedence, sort stability.
+- `tests/t_unit.py` -- identity, alias matching, baud precedence, sort stability,
+  theme cycling and the device-colour filter.
 - `tests/t_integ.py` -- drives the real program under a pty against socat-backed
   virtual serial ports: picker, data flow, every `ctrl-t` command, hotplug,
   auto-reconnect.
 - `tests/t_stress.py` -- repeated unplug/replug cycles, orphan-thread leak check,
   and killing the pty out from under a live reader.
 - `tests/t_ui.py` -- esc-resume with output buffering, alias naming and renaming,
-  non-USB filtering.
+  non-USB filtering, high-contrast switching.
 
 Needs `socat`.
 

@@ -1,5 +1,5 @@
 """Unit tests for porter's pure logic -- no tty, no hardware."""
-import sys, types, tempfile, pathlib, configparser
+import sys, types, tempfile, pathlib, configparser, contextlib, io
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import porter
 
@@ -129,6 +129,36 @@ check("renamed section matches device", porter._match_alias(cfg3, dev.key), "Cod
 check("id survives rename", cfg3["CodeBot 3"]["id"], dev.key)
 check("comments preserved on rename", before in tmp.read_text(), True)
 check("rename of missing section", porter.rename_alias(tmp, "nope", "x"), False)
+
+print("themes")
+with contextlib.redirect_stdout(io.StringIO()):   # swallow the OSC it emits
+    cycle = [porter.next_theme() for _ in range(3)]
+check("cycle wraps back to default", cycle,
+      ["contrast-dark", "contrast-light", "default"])
+check("high contrast spends no colour on roles",
+      porter.THEMES["contrast-dark"].alias, porter.BOLD)
+check("reset re-establishes the theme's own colours",
+      porter.THEMES["contrast-light"].reset, porter.SGR0 + porter.CSI + "0;30;107m")
+check("default theme leaves the terminal's colours alone",
+      porter.THEMES["default"].reset, porter.SGR0)
+
+print("device colours flattened under a high-contrast theme")
+def strip(*chunks):
+    f = porter._SGRStrip()
+    return b"".join(f.feed(c) for c in chunks) + f.flush()
+
+check("colour dropped", strip(b"a\x1b[31mred\x1b[0mb"), b"aredb")
+check("256-colour dropped", strip(b"\x1b[1;38;5;208mX"), b"X")
+check("cursor motion survives", strip(b"\x1b[2J\x1b[H\x1b[1;5Hx"),
+      b"\x1b[2J\x1b[H\x1b[1;5Hx")
+check("non-CSI escape survives", strip(b"\x1b(Bz"), b"\x1b(Bz")
+check("sequence split across reads", strip(b"one\x1b[3", b"1mtwo"), b"onetwo")
+check("split right after esc", strip(b"x\x1b", b"[32mgo"), b"xgo")
+check("split cursor sequence survives", strip(b"\x1b[1", b";2H!"), b"\x1b[1;2H!")
+check("a lone esc is not swallowed for ever",
+      strip(b"\x1b[" + b"9" * 40), b"\x1b[" + b"9" * 40)
+binary = bytes(range(256)).replace(b"\x1b", b"\x00")
+check("binary passes through untouched", strip(binary), binary)
 
 print()
 if fails:

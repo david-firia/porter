@@ -59,7 +59,7 @@ CLEAR_EOL = CSI + "K"
 CLEAR_EOS = CSI + "J"
 CLEAR_SCREEN = CSI + "2J" + CSI + "H"
 
-RESET = CSI + "0m"
+SGR0 = CSI + "0m"
 BOLD = CSI + "1m"
 DIM = CSI + "2m"
 REV = CSI + "7m"
@@ -67,6 +67,65 @@ CYAN = CSI + "36m"
 GREEN = CSI + "32m"
 YELLOW = CSI + "33m"
 RED = CSI + "31m"
+
+
+# --------------------------------------------------------------------------
+# Themes
+# --------------------------------------------------------------------------
+#
+# Sunlight eats every distinction the default palette is built out of: dim
+# greys, mid-tone colours, the gap between 36m and 32m.  A high-contrast theme
+# spends all of that on legibility instead -- one foreground, one background,
+# and bold or reverse for the few things that still have to stand out.
+#
+# Call sites ask for a *role* (`T.warn`), never a colour, so the theme is the
+# only thing that decides what a warning looks like.
+
+
+@dataclass(frozen=True)
+class Theme:
+    """A palette by role, plus the screen colours it wants the terminal set to."""
+
+    name: str
+    fg: str            # terminal default colours, as OSC 10/11 wants them;
+    bg: str            # empty means "leave the user's own scheme alone"
+    base: str          # SGR that re-establishes fg/bg after a reset
+    bold: str
+    muted: str         # counts, key hints, paths -- present but secondary
+    sel: str           # the selected row
+    alias: str         # a device the config has a name for
+    ok: str
+    warn: str
+    err: str
+    strip_sgr: bool    # flatten the device's own colours into the theme's
+
+    @property
+    def reset(self) -> str:
+        """End a styled run without falling back to the terminal's colours."""
+        return SGR0 + self.base
+
+
+# Both high-contrast themes spend their roles the same way; only the two
+# screen colours differ.
+_HC_ROLES = dict(bold=BOLD, muted="", sel=REV, alias=BOLD, ok=BOLD, warn=BOLD,
+                 err=REV, strip_sgr=True)
+
+THEMES = {
+    "default": Theme("default", fg="", bg="", base="",
+                     bold=BOLD, muted=DIM, sel=REV, alias=CYAN, ok=GREEN,
+                     warn=YELLOW, err=RED, strip_sgr=False),
+    "contrast-dark": Theme("contrast-dark", fg="#ffffff", bg="#000000",
+                           base=CSI + "0;97;40m", **_HC_ROLES),
+    "contrast-light": Theme("contrast-light", fg="#000000", bg="#ffffff",
+                            base=CSI + "0;30;107m", **_HC_ROLES),
+}
+
+# OSC 10/11 set the terminal's *own* default colours, so a switch repaints the
+# scrollback that is already on screen; 110/111 hand them back.
+_OSC_SET = "\x1b]10;{}\x07\x1b]11;{}\x07"
+_OSC_RESET = "\x1b]110\x07\x1b]111\x07"
+
+T = THEMES["default"]
 
 
 _OUT_LOCK = threading.Lock()
@@ -108,23 +167,98 @@ def w(text: str) -> None:
         sys.stdout.flush()
 
 
+class _SGRStrip:
+    """Drop SGR sequences from a stream of device bytes.
+
+    A high-contrast theme is worthless if the device paints its own dim blue
+    over the top of it.  Only colour and attribute sequences go; cursor motion
+    and erases pass through, so a full-screen program on the far end still
+    works -- it just arrives monochrome.
+
+    A sequence split across two reads is held back until it completes, which
+    is why this carries state and lives behind the output lock.
+    """
+
+    MAX_HOLD = 64          # a truecolour fg+bg run is ~40; past this it is data
+
+    def __init__(self) -> None:
+        self._held = bytearray()
+
+    def flush(self) -> bytes:
+        """Release a half-arrived sequence unchanged, for leaving strip mode."""
+        held, self._held = bytes(self._held), bytearray()
+        return held
+
+    def feed(self, data: bytes) -> bytes:
+        buf = self.flush() + data
+        out = bytearray()
+        i = 0
+        while True:
+            j = buf.find(0x1B, i)
+            if j < 0:
+                return bytes(out + buf[i:])
+            out += buf[i:j]
+            if j + 1 >= len(buf):
+                self._held = bytearray(buf[j:])
+                return bytes(out)
+            if buf[j + 1] != 0x5B:              # not CSI, so not ours to touch
+                out += buf[j:j + 2]
+                i = j + 2
+                continue
+            k = j + 2                           # scan to the final byte
+            while k < len(buf) and not 0x40 <= buf[k] <= 0x7E:
+                k += 1
+            if k == len(buf):
+                if k - j > self.MAX_HOLD:       # runaway: it was never a
+                    return bytes(out + buf[j:])  # sequence, stop swallowing it
+                self._held = bytearray(buf[j:])
+                return bytes(out)
+            if buf[k] != 0x6D:                  # 'm' is the only one we eat
+                out += buf[j:k + 1]
+            i = k + 1
+
+
+_SGR = _SGRStrip()
+
+
 def w_bytes(data: bytes) -> None:
     """Write device bytes straight through -- never via the text layer, which
     would rewrite newlines on Windows and corrupt binary output."""
     with _OUT_LOCK:
+        data = _SGR.feed(data) if T.strip_sgr else _SGR.flush() + data
+        if not data:
+            return
         sys.stdout.buffer.write(data)
         sys.stdout.buffer.flush()
 
 
-def note(text: str, color: str = DIM) -> None:
+def note(text: str, style: str | None = None) -> None:
     """Write a porter status line.  Raw mode, so newlines must be explicit."""
-    w(f"\r\n{color}[porter] {text}{RESET}\r\n")
+    w(f"\r\n{T.muted if style is None else style}[porter] {text}{T.reset}\r\n")
+
+
+def set_theme(name: str) -> None:
+    """Switch palette, and tell the terminal which default colours to paint."""
+    global T
+    had_colours = bool(T.fg)
+    T = THEMES[name]
+    if T.fg:
+        w(_OSC_SET.format(T.fg, T.bg) + T.reset)
+    elif had_colours:
+        w(_OSC_RESET + T.reset)
+
+
+def next_theme() -> str:
+    """Step to the next theme in the table.  Returns the name now in force."""
+    names = list(THEMES)
+    set_theme(names[(names.index(T.name) + 1) % len(names)])
+    return T.name
 
 
 @contextlib.contextmanager
 def alt_screen():
     """Run the picker on the alternate buffer so session scrollback survives."""
-    w(ALT_ON + CUR_HIDE)
+    w(ALT_ON + T.reset + CLEAR_SCREEN + CUR_HIDE)
     try:
         yield
     finally:
@@ -387,6 +521,10 @@ STARTER_CONFIG = """\
 [porter]
 baudrate = 115200
 # exclude = COM1, *Bluetooth*, /dev/ttyS*
+#
+# Start in a high-contrast palette instead of the default colours -- `H`
+# cycles the three at any time.  default | contrast-dark | contrast-light
+# theme = contrast-dark
 
 # An `id` may be a full vid:pid:serial for one specific board...
 #
@@ -695,12 +833,12 @@ def _render(devs, sel, fresh, waiting_label, spin, msg, cfg_path,
 
     count = f"{len(devs)} device{'' if len(devs) == 1 else 's'}"
     head = " porter"
-    rows.append(BOLD + head + RESET + DIM
-                + count.rjust(max(1, width - len(head) - 2)) + RESET)
+    rows.append(T.bold + head + T.reset + T.muted
+                + count.rjust(max(1, width - len(head) - 2)) + T.reset)
     rows.append("")
 
     if not devs:
-        rows.append(f"   {DIM}no serial devices - plug one in{RESET}")
+        rows.append(f"   {T.muted}no serial devices - plug one in{T.reset}")
     for i, d in enumerate(devs):
         marker = ">" if i == sel else " "
         num = str(i + 1) if i < 9 else " "
@@ -709,31 +847,32 @@ def _render(devs, sel, fresh, waiting_label, spin, msg, cfg_path,
         if d.key in fresh:
             plain += "  +new"
         if i == sel:
-            rows.append(REV + plain.ljust(width - 1) + RESET)
+            rows.append(T.sel + plain.ljust(width - 1) + T.reset)
         elif d.alias:
-            rows.append(CYAN + plain + RESET)
+            rows.append(T.alias + plain + T.reset)
         else:
             rows.append(plain)
 
     rows.append("")
     if waiting_label:
-        rows.append(f" {YELLOW}{spin} waiting for {waiting_label}"
-                    f"{RESET}{DIM}  (any key to cancel){RESET}")
+        rows.append(f" {T.warn}{spin} waiting for {waiting_label}"
+                    f"{T.reset}{T.muted}  (any key to cancel){T.reset}")
     if msg:
-        rows.append(f" {GREEN}{msg}{RESET}")
+        rows.append(f" {T.ok}{msg}{T.reset}")
     rows.append("")
 
     if prompt is not None:
-        rows.append(f" {BOLD}{prompt}{RESET}")
-        rows.append(DIM + " enter save  .  esc cancel" + RESET)
+        rows.append(f" {T.bold}{prompt}{T.reset}")
+        rows.append(T.muted + " enter save  .  esc cancel" + T.reset)
     else:
-        keys = (" j/k or arrows select  .  enter connect  .  1-9 jump"
-                "  .  b baud  .  a name")
+        rows.append(T.muted + " j/k or arrows select  .  enter connect"
+                    "  .  1-9 jump  .  b baud  .  a name" + T.reset)
+        keys = " H high contrast"
         keys += "  .  esc resume  .  q quit" if resumable else "  .  q quit"
-        rows.append(DIM + keys + RESET)
-        rows.append(DIM + f" aliases: {cfg_path}" + RESET)
+        rows.append(T.muted + keys + T.reset)
+        rows.append(T.muted + f" aliases: {cfg_path}" + T.reset)
 
-    w(HOME + (CLEAR_EOL + "\r\n").join(rows) + CLEAR_EOL + CLEAR_EOS)
+    w(T.reset + HOME + (CLEAR_EOL + "\r\n").join(rows) + CLEAR_EOL + CLEAR_EOS)
 
 
 def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
@@ -864,6 +1003,9 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 sel = next((i for i, x in enumerate(devs) if x.key == d.key), sel)
                 sel = max(0, min(sel, len(devs) - 1)) if devs else 0
             dirty = True
+        elif key == "H":
+            msg = f"theme: {next_theme()}"
+            dirty = True
         elif key == "r":
             cfg, _ = load_config(cfg_path)
             devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
@@ -891,7 +1033,7 @@ HELP = """\
  ctrl-t d   back to device picker  ctrl-t g   toggle DTR/RTS
  ctrl-t n   next device            ctrl-t b   send break
  ctrl-t l   clear screen           ctrl-t e   toggle local echo
- ctrl-t ctrl-t   send literal ctrl-t\
+ ctrl-t H   high-contrast mode     ctrl-t ctrl-t   send literal ctrl-t\
 """
 
 
@@ -973,7 +1115,7 @@ class Session:
             if self._thread.is_alive():
                 # Wedged in a native read.  Leaking one handle is strictly
                 # safer than closing it out from under the thread.
-                note("serial reader did not stop; leaking that handle", YELLOW)
+                note("serial reader did not stop; leaking that handle", T.warn)
 
     def pause(self) -> None:
         with self._lock:
@@ -1075,7 +1217,7 @@ class Session:
             pass
 
         if reason == LOST:
-            note(f"{self.dev.label} disconnected", YELLOW)
+            note(f"{self.dev.label} disconnected", T.warn)
         return reason
 
 
@@ -1091,7 +1233,7 @@ def _command(b: int, ser, dev: Device, outgoing: bytearray):
         outgoing.append(PREFIX)
         return None
     if ch == "?":
-        w("\r\n" + DIM + HELP.replace("\n", "\r\n") + RESET + "\r\n")
+        w("\r\n" + T.muted + HELP.replace("\n", "\r\n") + T.reset + "\r\n")
     elif ch == "q":
         return QUIT
     elif ch == "d":
@@ -1113,7 +1255,9 @@ def _command(b: int, ser, dev: Device, outgoing: bytearray):
         try:
             note(f"cts={ser.cts} dsr={ser.dsr} ri={ser.ri} cd={ser.cd}")
         except (OSError, serial.SerialException) as exc:
-            note(f"line states unavailable: {exc}", RED)
+            note(f"line states unavailable: {exc}", T.err)
+    elif ch == "H":
+        note(f"theme: {next_theme()}")
     elif ch == "g":
         note("toggle which line?  d=DTR  r=RTS")
         pick = _read_raw(3.0)
@@ -1171,6 +1315,12 @@ def main(argv=None) -> int:
     if warning:
         print(f"porter: config problem: {warning}", file=sys.stderr)
 
+    start_theme = (_global_get(cfg, "theme") or "default").strip()
+    if start_theme not in THEMES:
+        print(f"porter: unknown theme {start_theme!r}; using default",
+              file=sys.stderr)
+        start_theme = "default"
+
     if args.list:
         return cmd_list(cfg, args.baud)
 
@@ -1201,6 +1351,8 @@ def main(argv=None) -> int:
 
     with RawTerm():
         try:
+            set_theme(start_theme)
+
             while True:
                 if next_dev is None:
                     cfg, _ = load_config(path)
@@ -1227,7 +1379,7 @@ def main(argv=None) -> int:
                     fresh = Session(dev)
                     err = fresh.open()
                     if err:
-                        note(f"cannot open {dev.port}: {err}", RED)
+                        note(f"cannot open {dev.port}: {err}", T.err)
                         continue
                     current, last_key = fresh, dev.key
 
@@ -1242,7 +1394,7 @@ def main(argv=None) -> int:
                                   if d.key == current.dev.key), -1)
                         next_dev = devs[(i + 1) % len(devs)]
                     else:
-                        note("no other device", YELLOW)
+                        note("no other device", T.warn)
                 elif reason == LOST:
                     gone = current.dev.key
                     current.close()
@@ -1252,7 +1404,7 @@ def main(argv=None) -> int:
         finally:
             if current is not None:
                 current.close()
-            w(CUR_SHOW + RESET + "\r\n")
+            w(CUR_SHOW + SGR0 + (_OSC_RESET if T.fg else "") + "\r\n")
 
     return 0
 

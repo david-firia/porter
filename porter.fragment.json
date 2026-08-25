@@ -1,12 +1,12 @@
 {
-    "$help": "Copy to %LOCALAPPDATA%\\Microsoft\\Windows Terminal\\Fragments\\porter\\porter.json",
+    "$help": "Run install.ps1 to have this placed for you.  By hand: set commandline to the full path of porter.exe, then save this as %LOCALAPPDATA%\\Microsoft\\Windows Terminal\\Fragments\\porter\\porter.json (create the folders; they do not exist until something makes them).",
     "profiles": [
         {
             "name": "porter (serial)",
             "commandline": "porter",
             "startingDirectory": "%USERPROFILE%",
             "icon": "\ud83d\udd0c",
-            "closeOnExit": "always",
+            "closeOnExit": "graceful",
             "historySize": 20000
         }
     ]
