@@ -277,16 +277,29 @@ not if Windows Terminal was already running when you installed.
 
 ## Troubleshooting
 
-`--debug` starts a watchdog that dumps every thread's stack to a log if the main
-loop ever stops ticking. That is the right tool for a freeze, because a blocked
-main thread has nothing left to report with:
+`--debug` starts a watchdog. It writes a health line once a minute, and dumps
+every thread's stack the moment the main loop misbehaves -- either stalled in a
+native call or spinning. That is the right tool for both a freeze and a hot fan,
+because neither leaves anything on screen:
 
     python porter.py --debug porter-debug.log
+
+A line reads:
+
+    14:22:01  3 ticks/s, 0 non-key reads/s, port scan 41ms
+
+`ticks/s` is how often the main loop came round: 2-3 while the picker is up, ~20
+in a live session. `non-key reads/s` counts input the terminal sent that held no
+keystroke -- focus and mouse reports. `port scan` is what one enumeration of the
+serial ports cost; on Windows that is a full device-tree walk, and the scanner
+paces itself off it, so a slow one shows up as devices taking longer to appear
+rather than as CPU.
 
 ## Tests
 
 - `tests/t_unit.py` -- identity, alias matching, baud precedence, sort stability,
-  theme cycling and the device-colour filter.
+  theme cycling, the device-colour filter, key parsing, suspend recovery and
+  port-scanner pacing.
 - `tests/t_integ.py` -- drives the real program under a pty against socat-backed
   virtual serial ports: picker, data flow, every `ctrl-t` command, hotplug,
   auto-reconnect.

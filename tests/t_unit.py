@@ -1,5 +1,5 @@
 """Unit tests for porter's pure logic -- no tty, no hardware."""
-import sys, types, tempfile, pathlib, configparser, contextlib, io
+import sys, types, tempfile, pathlib, configparser, contextlib, io, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import porter
 
@@ -159,6 +159,100 @@ check("a lone esc is not swallowed for ever",
       strip(b"\x1b[" + b"9" * 40), b"\x1b[" + b"9" * 40)
 binary = bytes(range(256)).replace(b"\x1b", b"\x00")
 check("binary passes through untouched", strip(binary), binary)
+
+print("key parsing")
+
+def keys(*chunks, timeout=0.05):
+    """Feed keyboard bytes through read_key until it reports a timeout."""
+    queue = list(chunks)
+    porter._pending.clear()
+    porter._read_raw = lambda _t: queue.pop(0) if queue else b""
+    out = []
+    while True:
+        k = porter.read_key(timeout)
+        if k is None:
+            return out
+        out.append(k)
+
+check("plain characters", keys(b"abc"), ["a", "b", "c"])
+check("enter and tab", keys(b"\r\t"), ["ENTER", "TAB"])
+check("control byte", keys(b"\x14"), ["CTRL-T"])
+check("arrows", keys(b"\x1b[A\x1b[B\x1b[D"), ["UP", "DOWN", "LEFT"])
+check("ss3 arrow", keys(b"\x1bOA"), ["UP"])
+check("lone esc", keys(b"\x1b"), ["ESC"])
+check("esc then key", keys(b"\x1bz"), ["ESC", "z"])
+check("focus reports are not keys", keys(b"\x1b[I\x1b[O"), [])
+check("mouse report is not a key", keys(b"\x1b[<0;9;3M"), [])
+check("key survives surrounding reports", keys(b"\x1b[Iq\x1b[O"), ["q"])
+check("truncated sequence does not eat the next key",
+      keys(b"\x1b[1;", b"", b"x"), ["ESC", "[", "1", ";", "x"])
+check("sequence split across reads", keys(b"\x1b[", b"A"), ["UP"])
+check("sequence split right after esc", keys(b"\x1b", b"[B"), ["DOWN"])
+check("report split across reads is still not a key",
+      keys(b"\x1b[", b"Iq"), ["q"])
+
+# A terminal talking continuously must not turn a caller's poll into a spin:
+# read_key owns the deadline, so it returns None only once the timeout is up.
+porter._read_raw = lambda _t: b"\x1b[I"
+porter._pending.clear()
+t0 = time.monotonic()
+storm = porter.read_key(0.2)
+check("report storm returns nothing", storm, None)
+check("report storm still honours the timeout",
+      time.monotonic() - t0 >= 0.2, True)
+
+class _Stop(Exception): pass
+def _stop(): raise _Stop
+
+@contextlib.contextmanager
+def mock(obj, name, value):
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
+
+print("suspend recovery")
+
+armed = []
+with mock(porter, "arm_console", lambda: armed.append(1)):
+    porter._TICK[0] = time.monotonic()
+    porter._beat()
+    check("a normal tick re-arms nothing", armed, [])
+    porter._TICK[0] = time.monotonic() - porter.SUSPEND - 1
+    porter._beat()
+    check("a tick gap re-arms the console", armed, [1])
+
+print("port scanner pacing")
+
+class _Clock:
+    """monotonic() that advances by `cost` across every comports() call."""
+    def __init__(self, cost): self.t, self.cost = 1000.0, cost
+    def monotonic(self): return self.t
+
+def pacing(cost, interval=0.35):
+    clock = _Clock(cost)
+    slept = []
+    scanner = porter.PortScanner(interval)
+    def comports():
+        clock.t += cost
+        return []
+    with mock(porter.list_ports, "comports", comports), \
+         mock(porter.time, "monotonic", clock.monotonic), \
+         mock(porter.time, "sleep", lambda s: slept.append(s) or _stop()):
+        try:
+            scanner.run()
+        except _Stop:
+            pass
+    return scanner.last_scan, slept[0]
+
+cost, slept = pacing(0.01)
+check("cheap scan sleeps the interval", (round(cost, 3), round(slept, 3)),
+      (0.01, 0.35))
+cost, slept = pacing(0.5)
+check("slow scan backs off to keep its share", (round(cost, 3), round(slept, 3)),
+      (0.5, 4.0))
 
 print()
 if fails:

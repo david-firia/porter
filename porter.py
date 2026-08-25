@@ -37,7 +37,6 @@ WINDOWS = sys.platform == "win32"
 
 if WINDOWS:
     import ctypes
-    import msvcrt
 else:
     import select
     import termios
@@ -129,33 +128,63 @@ T = THEMES["default"]
 
 
 _OUT_LOCK = threading.Lock()
-_LAST_BEAT = [time.monotonic()]
+
+_TICK = [time.monotonic(), 0]   # last beat, and beats since the watchdog looked
+_NOISE = [0]                    # reads of terminal chatter that held no key
+SUSPEND = 4.0                   # a tick gap this long means we were not running
+SPIN = 200                      # ticks per second no loop has a reason to reach
 
 
 def _beat() -> None:
-    """Mark the main loop as alive, for the --debug watchdog."""
-    _LAST_BEAT[0] = time.monotonic()
+    """Tick the main loop: mark it alive, and recover from a suspend.
+
+    A gap that dwarfs every loop's poll timeout means the process was not
+    running -- a laptop that slept, or a terminal session that was detached --
+    and the terminal we come back to is not necessarily the one we left.
+    """
+    now = time.monotonic()
+    if now - _TICK[0] > SUSPEND:
+        arm_console()
+    _TICK[0] = now
+    _TICK[1] += 1
 
 
 def _start_watchdog(path: str, stall: float = 8.0) -> None:
-    """Dump every thread's stack if the main loop stops ticking.
+    """Log what the main loop is doing, and dump every thread when it misbehaves.
 
-    The failure this exists for is a native call blocking the main thread,
-    where there is nothing left to print the diagnosis from.
+    Two failures need catching and neither leaves anything on screen: the main
+    thread blocked in a native call, and the main thread spinning on input it
+    discards, which shows up as a hot fan rather than a hang.  The once-a-minute
+    line is there so a lockup found hours later still has a before and after.
     """
     log = open(path, "a", buffering=1, encoding="utf-8")
     log.write(f"\n=== porter started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     faulthandler.enable(file=log, all_threads=True)
 
     def run():
+        next_report = 0.0
         while True:
             time.sleep(1.0)
-            behind = time.monotonic() - _LAST_BEAT[0]
+            now = time.monotonic()
+            behind, ticks = now - _TICK[0], _TICK[1]
+            _TICK[1] = 0
+            noise, _NOISE[0] = _NOISE[0], 0
+            scan = SCANNER.last_scan if SCANNER is not None else 0.0
+            health = (f"{ticks} ticks/s, {noise} non-key reads/s, "
+                      f"port scan {scan * 1000:.0f}ms")
+
+            trouble = None
             if behind > stall:
-                log.write(f"\n=== main loop stalled {behind:.1f}s at "
-                          f"{time.strftime('%H:%M:%S')} ===\n")
+                trouble = f"main loop stalled {behind:.1f}s"
+                _TICK[0] = now
+            elif ticks > SPIN:
+                trouble = f"main loop spinning: {health}"
+            if trouble:
+                log.write(f"\n=== {trouble} at {time.strftime('%H:%M:%S')} ===\n")
                 faulthandler.dump_traceback(file=log, all_threads=True)
-                _LAST_BEAT[0] = time.monotonic()
+            elif now >= next_report:
+                next_report = now + 60.0
+                log.write(f"{time.strftime('%H:%M:%S')}  {health}\n")
 
     threading.Thread(target=run, daemon=True, name="watchdog").start()
 
@@ -277,88 +306,16 @@ _ENABLE_ECHO_INPUT = 0x0004
 _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 
-
-class RawTerm:
-    """Put the console in raw mode and restore it whatever happens.
-
-    Clearing ENABLE_PROCESSED_INPUT on Windows is what lets ctrl-c reach the
-    device as a 0x03 byte instead of raising KeyboardInterrupt, and
-    ENABLE_VIRTUAL_TERMINAL_INPUT makes Windows deliver arrow keys as ANSI
-    sequences -- so one key parser covers both platforms.
-    """
-
-    def __init__(self) -> None:
-        self._saved_in = None
-        self._saved_out = None
-
-    def __enter__(self) -> "RawTerm":
-        if WINDOWS:
-            k = ctypes.windll.kernel32
-            # Declare signatures: a HANDLE is pointer-sized, and ctypes would
-            # otherwise truncate it to a 32-bit int on 64-bit Windows.
-            k.GetStdHandle.restype = ctypes.c_void_p
-            k.GetStdHandle.argtypes = [ctypes.c_uint32]
-            k.GetConsoleMode.argtypes = [ctypes.c_void_p,
-                                         ctypes.POINTER(ctypes.c_uint32)]
-            k.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-            k.GetNumberOfConsoleInputEvents.argtypes = [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-            k.ReadConsoleInputW.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_uint32)]
-            global _WIN_HIN
-            self._hin = k.GetStdHandle(_STD_INPUT)
-            _WIN_HIN = self._hin
-            self._hout = k.GetStdHandle(_STD_OUTPUT)
-            mode_in = ctypes.c_uint32()
-            mode_out = ctypes.c_uint32()
-            k.GetConsoleMode(self._hin, ctypes.byref(mode_in))
-            k.GetConsoleMode(self._hout, ctypes.byref(mode_out))
-            self._saved_in = mode_in.value
-            self._saved_out = mode_out.value
-
-            raw = mode_in.value & ~(
-                _ENABLE_PROCESSED_INPUT | _ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
-            )
-            if not k.SetConsoleMode(self._hin, raw | _ENABLE_VIRTUAL_TERMINAL_INPUT):
-                # Legacy conhost: fall back to raw without VT input.  _read_raw
-                # translates the 0x00/0xe0 special-key prefixes in that case.
-                k.SetConsoleMode(self._hin, raw)
-            k.SetConsoleMode(
-                self._hout, mode_out.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            )
-        else:
-            self._fd = sys.stdin.fileno()
-            self._saved_in = termios.tcgetattr(self._fd)
-            tty.setraw(self._fd)
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        if self._saved_in is None:
-            return False
-        if WINDOWS:
-            k = ctypes.windll.kernel32
-            k.SetConsoleMode(self._hin, self._saved_in)
-            k.SetConsoleMode(self._hout, self._saved_out)
-        else:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_in)
-        return False
-
-
-# Legacy-conhost special keys, mapped onto the ANSI sequences we parse anyway.
 # Windows console input.
 #
-# msvcrt.kbhit()/getwch() is not safe here.  kbhit() promises exactly ONE
-# character; the prefix path used to call getwch() a second time for the
-# 0x00/0xe0 lead byte, which blocks forever when no second record follows --
-# a dead main thread, so no keyboard, no port polling and no way to quit.
-# Reading INPUT_RECORDs directly can never block: we ask how many are queued
-# and read only that many.
+# Reading INPUT_RECORDs directly is what makes the poll non-blocking: we ask
+# how many events are queued and read only that many.  Resize, focus, menu and
+# mouse records are discarded here rather than handed to the key parser.
 
 _KEY_EVENT = 0x0001
 
-# Legacy fallback for when ENABLE_VIRTUAL_TERMINAL_INPUT could not be set:
-# synthesise the VT sequence the parser already understands.
+# Used when ENABLE_VIRTUAL_TERMINAL_INPUT could not be set: synthesise the VT
+# sequence the parser already understands.
 _VK_SEQ = {0x26: b"\x1b[A", 0x28: b"\x1b[B", 0x25: b"\x1b[D", 0x27: b"\x1b[C",
            0x24: b"\x1b[H", 0x23: b"\x1b[F", 0x2E: b"\x1b[3~"}
 
@@ -379,21 +336,123 @@ if WINDOWS:
     class _INPUT_RECORD(ctypes.Structure):
         _fields_ = [("EventType", ctypes.c_ushort), ("Event", _EVENT_UNION)]
 
+    # INPUT_RECORD is 20 bytes on every Windows ABI.  A mismatch would misparse
+    # every keystroke, so say so instead of reading garbage.
+    if ctypes.sizeof(_INPUT_RECORD) != 20:
+        sys.exit(f"porter: unexpected INPUT_RECORD layout "
+                 f"({ctypes.sizeof(_INPUT_RECORD)} bytes)")
 
-_WIN_HIN = None          # console input handle, set by RawTerm
+    _K = ctypes.windll.kernel32
+    # A HANDLE is pointer-sized; ctypes would otherwise truncate it to a
+    # 32-bit int on 64-bit Windows.
+    _K.GetStdHandle.restype = ctypes.c_void_p
+    _K.GetStdHandle.argtypes = [ctypes.c_uint32]
+    _K.GetConsoleMode.argtypes = [ctypes.c_void_p,
+                                  ctypes.POINTER(ctypes.c_uint32)]
+    _K.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _K.GetNumberOfConsoleInputEvents.argtypes = [ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_uint32)]
+    _K.ReadConsoleInputW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_uint32,
+                                     ctypes.POINTER(ctypes.c_uint32)]
 
-# INPUT_RECORD is 20 bytes on x86 and x64 alike.  If the layout ever disagrees,
-# fall back to msvcrt rather than silently misparse every keystroke.
-_win_console_ok = (not WINDOWS) or ctypes.sizeof(_INPUT_RECORD) == 20
+
+_WIN_HIN = None           # console input handle, refreshed by _win_handles
+_WIN_HOUT = None
+_ARM_GAP = 1.0            # do not re-arm the console faster than this
+_last_arm = [float("-inf")]
+
+
+def _win_handles():
+    """Fetch the console handles, replacing any we already hold.
+
+    A terminal that reconnects hands out new handles for the same console, and
+    the old ones stop answering, so nothing may cache them across a failure.
+    """
+    global _WIN_HIN, _WIN_HOUT
+    _WIN_HIN = _K.GetStdHandle(_STD_INPUT)
+    _WIN_HOUT = _K.GetStdHandle(_STD_OUTPUT)
+    return _WIN_HIN, _WIN_HOUT
+
+
+def arm_console() -> None:
+    """Put the console input side in raw mode, on a fresh handle.
+
+    Raw mode is not something you set once.  A read that stops answering and a
+    return from suspend both land here: Windows hands back a console with line
+    input and echo switched on, which presents as a keyboard that has stopped
+    working.  Idempotent, and rate-limited so a handle that never recovers
+    cannot turn the poll loop into a stream of console API calls.
+
+    POSIX needs none of this -- a termios raw mode survives a suspend.
+    """
+    if not WINDOWS:
+        return
+    now = time.monotonic()
+    if now - _last_arm[0] < _ARM_GAP:
+        return
+    _last_arm[0] = now
+
+    hin, hout = _win_handles()
+    mode = ctypes.c_uint32()
+    if not _K.GetConsoleMode(hin, ctypes.byref(mode)):
+        return
+    raw = mode.value & ~(_ENABLE_PROCESSED_INPUT | _ENABLE_LINE_INPUT
+                         | _ENABLE_ECHO_INPUT)
+    # Legacy conhost: fall back to raw without VT input, where the 0x00/0xe0
+    # special-key prefixes come through as virtual key codes instead.
+    if not _K.SetConsoleMode(hin, raw | _ENABLE_VIRTUAL_TERMINAL_INPUT):
+        _K.SetConsoleMode(hin, raw)
+    if _K.GetConsoleMode(hout, ctypes.byref(mode)):
+        _K.SetConsoleMode(hout, mode.value
+                          | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+
+
+class RawTerm:
+    """Put the console in raw mode and restore it whatever happens.
+
+    Clearing ENABLE_PROCESSED_INPUT on Windows is what lets ctrl-c reach the
+    device as a 0x03 byte instead of raising KeyboardInterrupt, and
+    ENABLE_VIRTUAL_TERMINAL_INPUT makes Windows deliver arrow keys as ANSI
+    sequences -- so one key parser covers both platforms.
+    """
+
+    def __init__(self) -> None:
+        self._saved_in = None
+        self._saved_out = None
+
+    def __enter__(self) -> "RawTerm":
+        if WINDOWS:
+            hin, hout = _win_handles()
+            mode_in = ctypes.c_uint32()
+            mode_out = ctypes.c_uint32()
+            _K.GetConsoleMode(hin, ctypes.byref(mode_in))
+            _K.GetConsoleMode(hout, ctypes.byref(mode_out))
+            self._saved_in = mode_in.value
+            self._saved_out = mode_out.value
+            arm_console()
+        else:
+            self._fd = sys.stdin.fileno()
+            self._saved_in = termios.tcgetattr(self._fd)
+            tty.setraw(self._fd)
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._saved_in is None:
+            return False
+        if WINDOWS:
+            _K.SetConsoleMode(_WIN_HIN, self._saved_in)
+            _K.SetConsoleMode(_WIN_HOUT, self._saved_out)
+        else:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_in)
+        return False
 
 
 def _win_read_console() -> bytes:
     """Drain queued key events.  Never blocks; returns b'' when idle."""
-    global _win_console_ok
-    k = ctypes.windll.kernel32
     pending = ctypes.c_uint32()
-    if not k.GetNumberOfConsoleInputEvents(_WIN_HIN, ctypes.byref(pending)):
-        _win_console_ok = False
+    if not _K.GetNumberOfConsoleInputEvents(_WIN_HIN, ctypes.byref(pending)):
+        arm_console()          # stale handle: the next poll uses the new one
         return b""
     if pending.value == 0:
         return b""
@@ -401,15 +460,13 @@ def _win_read_console() -> bytes:
     count = min(pending.value, 128)
     recs = (_INPUT_RECORD * count)()
     got = ctypes.c_uint32()
-    if not k.ReadConsoleInputW(_WIN_HIN, recs, count, ctypes.byref(got)):
-        _win_console_ok = False
+    if not _K.ReadConsoleInputW(_WIN_HIN, recs, count, ctypes.byref(got)):
+        arm_console()
         return b""
 
     out = bytearray()
     for i in range(got.value):
         rec = recs[i]
-        # Resize, focus, menu and mouse records are discarded here.  Letting
-        # them reach the old kbhit() loop is what made it wedge.
         if rec.EventType != _KEY_EVENT:
             continue
         key = rec.Event.KeyEvent
@@ -428,7 +485,7 @@ def _read_raw(timeout: float) -> bytes:
     if WINDOWS:
         deadline = time.monotonic() + timeout
         while True:
-            data = _win_read_console() if _win_console_ok else _win_read_msvcrt()
+            data = _win_read_console()
             if data or time.monotonic() >= deadline:
                 return data
             time.sleep(0.004)
@@ -442,65 +499,95 @@ def _read_raw(timeout: float) -> bytes:
         return b""
 
 
-def _win_read_msvcrt() -> bytes:
-    """Fallback if the console API is unavailable.  Guarded: the lead-byte
-    read only happens when a second character is genuinely queued."""
-    legacy = {"H": b"\x1b[A", "P": b"\x1b[B", "K": b"\x1b[D", "M": b"\x1b[C",
-              "G": b"\x1b[H", "O": b"\x1b[F", "S": b"\x1b[3~"}
-    out = bytearray()
-    while msvcrt.kbhit():
-        ch = msvcrt.getwch()
-        if ch in ("\x00", "\xe0"):
-            if not msvcrt.kbhit():
-                continue                      # lone prefix: drop, never block
-            out += legacy.get(msvcrt.getwch(), b"")
-        else:
-            out += ch.encode("utf-8", "replace")
-    return bytes(out)
-
-
 _ARROWS = {0x41: "UP", 0x42: "DOWN", 0x43: "RIGHT", 0x44: "LEFT",
            0x48: "HOME", 0x46: "END"}
 _pending = bytearray()
 
 
-def read_key(timeout: float = 0.4):
-    """Return a key token ('UP', 'ENTER', 'q', ...) or None on timeout."""
-    if not _pending:
-        _pending.extend(_read_raw(timeout))
+ESC_WAIT = 0.03     # how long the rest of an escape sequence has to arrive
+
+
+def _sequence_end():
+    """Index of the final byte of the CSI/SS3 sequence at the head of
+    `_pending`, or None when there is not a whole one there yet."""
+    if len(_pending) < 3 or _pending[1] not in (0x5B, 0x4F):
+        return None
+    i = 2
+    while i < len(_pending) and not 0x40 <= _pending[i] <= 0x7E:
+        i += 1
+    return None if i >= len(_pending) else i
+
+
+def _next_key():
+    """Pop one key token off `_pending`.
+
+    Returns None when the bytes consumed were not a key, and never consumes a
+    byte it has not identified -- half of a sequence is put back rather than
+    thrown away, which is what stops a slow arrow key arriving as a stray 'A'.
+    """
     if not _pending:
         return None
 
-    if _pending[0] == 0x1B:
-        if len(_pending) == 1:
-            _pending.extend(_read_raw(0.03))
-        if len(_pending) == 1:
-            del _pending[0]
-            return "ESC"
-        if _pending[1] in (0x5B, 0x4F):  # CSI / SS3
-            i = 2
-            while i < len(_pending) and not 0x40 <= _pending[i] <= 0x7E:
-                i += 1
-            if i >= len(_pending):
-                _pending.clear()
-                return None
-            final = _pending[i]
-            del _pending[: i + 1]
-            return _ARROWS.get(final, "UNKNOWN")
-        del _pending[:2]
-        return "ESC"
+    if _pending[0] != 0x1B:
+        b = _pending[0]
+        del _pending[0]
+        if b in (0x0D, 0x0A):
+            return "ENTER"
+        if b == 0x09:
+            return "TAB"
+        if b in (0x08, 0x7F):
+            return "BACK"
+        if b < 0x20:
+            return f"CTRL-{chr(b + 64)}"
+        return chr(b)
 
-    b = _pending[0]
-    del _pending[0]
-    if b in (0x0D, 0x0A):
-        return "ENTER"
-    if b == 0x09:
-        return "TAB"
-    if b in (0x08, 0x7F):
-        return "BACK"
-    if b < 0x20:
-        return f"CTRL-{chr(b + 64)}"
-    return chr(b)
+    # An escape is either the ESC key or the start of a sequence, and only what
+    # follows tells them apart.  Give the rest a moment to turn up; if no
+    # sequence completes, the escape stood alone.
+    end = _sequence_end()
+    if end is None:
+        _pending.extend(_read_raw(ESC_WAIT))
+        end = _sequence_end()
+    if end is None:
+        del _pending[0]
+        return "ESC"
+    final = _pending[end]
+    del _pending[: end + 1]
+    return _ARROWS.get(final)               # anything else is a report, not a key
+
+
+DRAIN = 0.005       # pace at which input that holds no keys is thrown away
+
+
+def read_key(timeout: float = 0.4):
+    """Return a key token ('UP', 'ENTER', 'q', ...) or None after `timeout`.
+
+    Terminal reports -- focus in and out, cursor position, mouse -- arrive on
+    the same channel as keystrokes and are not keys.  They are dropped here so
+    that callers only ever see keys, and dropped at a fixed rate: a terminal
+    that talks continuously would otherwise be answered as fast as it can talk,
+    which is a spin.  Bytes already in hand are always parsed first, so a real
+    keystroke never waits behind the pacing.
+    """
+    deadline = time.monotonic() + timeout
+    discarded = False
+    while True:
+        while _pending:
+            key = _next_key()
+            if key is not None:
+                return key
+            discarded = True
+
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        if discarded:
+            _NOISE[0] += 1
+            discarded = False
+            time.sleep(min(left, DRAIN))
+            left = deadline - time.monotonic()
+
+        _pending.extend(_read_raw(max(0.0, left)))
 
 
 # --------------------------------------------------------------------------
@@ -618,11 +705,20 @@ class PortScanner(threading.Thread):
     most, right after a replug.  The UI reads a cached snapshot and never
     blocks.  Also tracks how long each device has been continuously present,
     so auto-reconnect can wait for the driver instead of racing it.
+
+    That walk is pure-Python ctypes, so it holds the GIL for most of its
+    duration and its cost is set by the state of the machine's device tree, not
+    by anything porter controls.  Polling it on a fixed interval therefore has
+    no upper bound: the sleep is paced off the last scan instead, which caps
+    this thread at a fixed share of one core however slow enumeration gets.
     """
+
+    SHARE = 8           # sleep at least this many times the last scan's cost
 
     def __init__(self, interval: float = 0.35) -> None:
         super().__init__(daemon=True, name="port-scanner")
         self.interval = interval
+        self.last_scan = 0.0        # seconds the most recent scan took
         self._lock = threading.Lock()
         self._ports: list = []
         self._since: dict = {}
@@ -631,20 +727,27 @@ class PortScanner(threading.Thread):
     def run(self) -> None:
         since: dict = {}
         while True:
+            started = time.monotonic()
             try:
                 ports = list(list_ports.comports())
             except Exception:
-                ports = []
+                # Enumeration failing means "unknown", not "all unplugged":
+                # keep the last snapshot rather than report every device gone.
+                ports = None
             now = time.monotonic()
-            keys = {_identity(p) for p in ports}
-            for gone in [k for k in since if k not in keys]:
-                del since[gone]
-            for k in keys:
-                since.setdefault(k, now)
-            with self._lock:
-                self._ports, self._since = ports, dict(since)
-            self.ready.set()
-            time.sleep(self.interval)
+            self.last_scan = now - started
+
+            if ports is not None:
+                keys = {_identity(p) for p in ports}
+                for gone in [k for k in since if k not in keys]:
+                    del since[gone]
+                for k in keys:
+                    since.setdefault(k, now)
+                with self._lock:
+                    self._ports, self._since = ports, dict(since)
+                self.ready.set()
+
+            time.sleep(max(self.interval, self.last_scan * self.SHARE))
 
     def ports(self) -> list:
         with self._lock:
