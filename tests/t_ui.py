@@ -3,7 +3,8 @@ import os, pty, re, subprocess, sys, time, pathlib, fcntl, termios, struct
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FLAG = pathlib.Path("/tmp/porter_present"); CFG = pathlib.Path("/tmp/porter_ui_config")
-CFG.unlink(missing_ok=True); FLAG.write_text("")
+FLAG_B = pathlib.Path("/tmp/porter_present_b")
+CFG.unlink(missing_ok=True); FLAG.write_text(""); FLAG_B.write_text("")
 
 socats = [subprocess.Popen(["socat", f"pty,raw,echo=0,link=/tmp/porter_{a}",
                             f"pty,raw,echo=0,link=/tmp/porter_{b}"], stderr=subprocess.DEVNULL)
@@ -119,7 +120,7 @@ record("still in picker after cancel", proc.poll() is None)
 
 print("high contrast")
 CUR[0] = len(buf)
-send("H")
+send("h")
 # set_theme writes the OSC before the picker redraws with the new message.
 expect("terminal told the new background", r"\x1b\]11;#000000\x07")
 expect("picker reports the theme", r"theme: contrast-dark")
@@ -132,15 +133,37 @@ record("device colour flattened in high contrast",
        i > 0 and b"\x1b[31m" not in bytes(buf)[CUR[0]:i], f"at {i}")
 
 CUR[0] = len(buf)
-send(b"\x14H"); expect("cycles to the light theme", r"theme: contrast-light")
-send(b"\x14H")
+send(b"\x14h"); expect("cycles to the light theme", r"theme: contrast-light")
+send(b"\x14h")
 expect("terminal colours handed back", r"\x1b\]110\x07\x1b\]111\x07")
 expect("cycles back to default", r"theme: default")
 CUR[0] = len(buf)
-os.write(dev, b"\x1b[31mCRIMSON\x1b[0m\r\n"); pump(0.5)
+# 2.0s, not 0.5: the theme ack is still up, and an ack holds device output.
+os.write(dev, b"\x1b[31mCRIMSON\x1b[0m\r\n"); pump(2.0)
 j = bytes(buf).find(b"CRIMSON", CUR[0])
 record("device colour restored under the default theme",
        j > 0 and b"\x1b[31m" in bytes(buf)[CUR[0]:j], f"at {j}")
+
+print("acks are transient, and never reach the scrollback")
+CUR[0] = len(buf)
+send(b"\x14e")                                   # "local echo on", as a toast
+os.write(dev, b"HELDBACK\r\n"); pump(0.5)
+record("device output held while the ack is up",
+       b"HELDBACK" not in bytes(buf)[CUR[0]:])
+pump(1.6)                                        # outlive TOAST_SECS
+record("held output flushed once the ack expires",
+       b"HELDBACK" in bytes(buf)[CUR[0]:])
+record("ack taken back with an erase-to-end-of-line",
+       b"\x1b7\x1b[K\x1b8" in bytes(buf)[CUR[0]:])
+send(b"\x14e"); pump(1.8)                        # echo off again, ack expired
+
+print("help is a page, not scrollback")
+CUR[0] = len(buf)
+send(b"\x14?")
+expect("help on the alternate screen", r"\x1b\[\?1049h")
+expect("help text", r"ctrl-t d")
+send("\r")
+expect("back to the main buffer", r"\x1b\[\?1049l")
 
 send(b"\x14d"); expect("picker for exit", r"q quit")
 

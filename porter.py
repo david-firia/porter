@@ -19,6 +19,7 @@ import contextlib
 import faulthandler
 import fnmatch
 import os
+import queue
 import re
 import shutil
 import sys
@@ -57,6 +58,10 @@ HOME = CSI + "H"
 CLEAR_EOL = CSI + "K"
 CLEAR_EOS = CSI + "J"
 CLEAR_SCREEN = CSI + "2J" + CSI + "H"
+SAVE_CUR = "\x1b7"
+REST_CUR = "\x1b8"
+WRAP_OFF = CSI + "?7l"
+WRAP_ON = CSI + "?7h"
 
 SGR0 = CSI + "0m"
 BOLD = CSI + "1m"
@@ -127,10 +132,7 @@ _OSC_RESET = "\x1b]110\x07\x1b]111\x07"
 T = THEMES["default"]
 
 
-_OUT_LOCK = threading.Lock()
-
 _TICK = [time.monotonic(), 0]   # last beat, and beats since the watchdog looked
-_NOISE = [0]                    # reads of terminal chatter that held no key
 SUSPEND = 4.0                   # a tick gap this long means we were not running
 SPIN = 200                      # ticks per second no loop has a reason to reach
 
@@ -168,10 +170,8 @@ def _start_watchdog(path: str, stall: float = 8.0) -> None:
             now = time.monotonic()
             behind, ticks = now - _TICK[0], _TICK[1]
             _TICK[1] = 0
-            noise, _NOISE[0] = _NOISE[0], 0
-            scan = SCANNER.last_scan if SCANNER is not None else 0.0
-            health = (f"{ticks} ticks/s, {noise} non-key reads/s, "
-                      f"port scan {scan * 1000:.0f}ms")
+            scan = WATCHER.last_scan if WATCHER is not None else 0.0
+            health = f"{ticks} ticks/s, port scan {scan * 1000:.0f}ms"
 
             trouble = None
             if behind > stall:
@@ -190,10 +190,16 @@ def _start_watchdog(path: str, stall: float = 8.0) -> None:
 
 
 def w(text: str) -> None:
-    """Write UI text to the terminal."""
-    with _OUT_LOCK:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+    """Write UI text to the terminal.
+
+    There is no lock here, and nothing to contend for: every write to the
+    terminal happens on the main thread.  Device output reaches the screen as
+    an event painted by the main loop, not by the thread that read it, which
+    is what retired the output lock along with the reader's share of the SGR
+    filter's state.
+    """
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
 class _SGRStrip:
@@ -205,7 +211,7 @@ class _SGRStrip:
     works -- it just arrives monochrome.
 
     A sequence split across two reads is held back until it completes, which
-    is why this carries state and lives behind the output lock.
+    is why this carries state -- state only the main thread ever touches.
     """
 
     MAX_HOLD = 64          # a truecolour fg+bg run is ~40; past this it is data
@@ -253,16 +259,166 @@ _SGR = _SGRStrip()
 def w_bytes(data: bytes) -> None:
     """Write device bytes straight through -- never via the text layer, which
     would rewrite newlines on Windows and corrupt binary output."""
-    with _OUT_LOCK:
-        data = _SGR.feed(data) if T.strip_sgr else _SGR.flush() + data
-        if not data:
+    data = _SGR.feed(data) if T.strip_sgr else _SGR.flush() + data
+    if not data:
+        return
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+
+
+# --------------------------------------------------------------------------
+# The event bus
+# --------------------------------------------------------------------------
+
+KEY, RX, GONE, PORTS = "key", "rx", "gone", "ports"
+
+TICK = 0.2          # how often a waiting loop wakes to check the clock
+POLL = 0.4          # picker idle wake-up
+
+
+class Bus:
+    """The one place porter waits.
+
+    Every source porter reacts to -- the keyboard, the device's output, the
+    port list -- runs on its own thread and only ever *posts* here.  The main
+    loop's only wait is a get(), so the wait-for graph is a star with all its
+    edges pointing at this queue and no thread ever holding it.  No cycle is
+    expressible, which is what makes the design deadlock-free rather than
+    merely deadlock-free-so-far.
+
+    The queue is unbounded, so a post never blocks and no producer can ever
+    end up waiting on the consumer.  Keeping it unbounded is the invariant --
+    a capacity here would put the producers back into the wait graph, and
+    output is bounded by `Screen` instead, where the main thread owns it.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue = queue.Queue()
+
+    def post(self, kind: str, payload=None) -> None:
+        self._q.put((kind, payload))
+
+    def get(self, timeout: float):
+        """The next event, or (None, None) if none arrived in time."""
+        try:
+            return self._q.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return None, None
+
+
+BUS = Bus()
+
+BACKLOG_MAX = 256 * 1024
+
+
+class Screen:
+    """Who owns the terminal right now: the device, or porter.
+
+    The main loop never stops draining the bus -- it parks device bytes here
+    while porter has something on screen.  That is what lets the queue stay
+    unbounded: held output is capped in one place, by the single thread that
+    owns it, so there is no lock and no coordination.
+
+    Holds nest, because a page can open over a session that is already held.
+    """
+
+    def __init__(self) -> None:
+        self.held = 0
+        self._buf = bytearray()
+
+    def hold(self) -> None:
+        self.held += 1
+
+    def release(self) -> bytes:
+        """Give the terminal back, and hand over what arrived meanwhile."""
+        self.held = max(0, self.held - 1)
+        if self.held:
+            return b""
+        buf, self._buf = bytes(self._buf), bytearray()
+        return buf
+
+    def feed(self, data: bytes) -> None:
+        """Device output: straight to the terminal, or into the hold."""
+        if self.held:
+            self._buf.extend(data)
+            if len(self._buf) > BACKLOG_MAX:
+                del self._buf[:-BACKLOG_MAX]
+        else:
+            w_bytes(data)
+
+
+SCREEN = Screen()
+
+
+def _flush(data: bytes) -> None:
+    if data:
+        w_bytes(data)
+
+
+TOAST_SECS = 1.5
+
+
+class _Toast:
+    """A one-line ack painted over the session instead of into it.
+
+    An ack answers a key you just pressed -- read once, then worthless in a
+    capture of the device's output.  It is painted at the cursor with autowrap
+    off, so an over-long one is clipped at the right margin instead of
+    wrapping and scrolling a fragment into the very scrollback this exists to
+    keep clean, and it is taken back with a plain erase-to-end-of-line.
+
+    That erase is only exact while the cursor has not moved since the paint,
+    which is what holding the device buys.  Restoring the cursor uses the
+    terminal's one save slot, so a full-screen program on the far end can lose
+    a cursor it saved earlier.
+
+    One slot, so repeated presses replace rather than stack.
+    """
+
+    def __init__(self) -> None:
+        self._up = False
+        self._until = 0.0
+
+    def show(self, text: str, style: str | None = None) -> None:
+        self.clear()
+        self._up = True
+        self._until = time.monotonic() + TOAST_SECS
+        SCREEN.hold()
+        w(WRAP_OFF + SAVE_CUR + (T.muted if style is None else style)
+          + f"[porter] {text}" + T.reset + REST_CUR + WRAP_ON)
+
+    def clear(self) -> None:
+        """Take the ack back and let the held output through."""
+        if not self._up:
             return
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
+        self._up = False
+        w(SAVE_CUR + CLEAR_EOL + REST_CUR)
+        _flush(SCREEN.release())
+
+    def tick(self, now: float) -> None:
+        if self._up and now >= self._until:
+            self.clear()
+
+
+_TOAST = _Toast()
+
+
+def toast(text: str, style: str | None = None) -> None:
+    """Show a transient ack that never reaches the scrollback."""
+    _TOAST.show(text, style)
 
 
 def note(text: str, style: str | None = None) -> None:
-    """Write a porter status line.  Raw mode, so newlines must be explicit."""
+    """Write a porter status line into the session.
+
+    Notes are the messages that earn their place in a capture of the device's
+    output: what porter did to the wire, and what the connection did.  A log
+    with a gap in it is worth less than one that says why.  Raw mode, so
+    newlines must be explicit.
+    """
+    _TOAST.clear()          # a real event outranks an ack still on screen
     w(f"\r\n{T.muted if style is None else style}[porter] {text}{T.reset}\r\n")
 
 
@@ -355,6 +511,13 @@ if WINDOWS:
     _K.ReadConsoleInputW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                      ctypes.c_uint32,
                                      ctypes.POINTER(ctypes.c_uint32)]
+    # ctypes releases the GIL for the duration of a windll call, so blocking
+    # here does not stop the other threads -- which is the whole point.
+    _K.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _K.WaitForSingleObject.restype = ctypes.c_uint32
+
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
 
 
 _WIN_HIN = None           # console input handle, refreshed by _win_handles
@@ -480,19 +643,50 @@ def _win_read_console() -> bytes:
     return bytes(out)
 
 
-def _read_raw(timeout: float) -> bytes:
-    """Return whatever keyboard input is available, or b'' after `timeout`."""
-    if WINDOWS:
-        deadline = time.monotonic() + timeout
-        while True:
-            data = _win_read_console()
-            if data or time.monotonic() >= deadline:
-                return data
-            time.sleep(0.004)
+DEAD_WAIT = 0.25    # floor under a wait that failed instead of waiting
 
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not ready:
+
+def _wait_input(timeout: float) -> bool:
+    """Block until the keyboard has something, or `timeout` runs out.
+
+    This is the wait that replaced a 250Hz poll, and it keeps one rule: a
+    *failed* wait must still cost time.  A console handle that has gone --
+    which is what a sleep/wake cycle can hand back on Windows -- fails
+    immediately, and a wait that returns instantly for ever is the same pegged
+    core the poll was, only written more elegantly.  Going event-driven does
+    not save you from a dead handle; this is what does.
+    """
+    if not WINDOWS:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (OSError, ValueError):
+            time.sleep(min(timeout, DEAD_WAIT))
+            return False
+        return bool(ready)
+
+    rc = _K.WaitForSingleObject(_WIN_HIN, int(max(0.0, timeout) * 1000))
+    if rc == _WAIT_OBJECT_0:
+        return True
+    if rc == _WAIT_TIMEOUT:
+        return False
+    arm_console()               # stale handle: get a fresh one for next time
+    time.sleep(min(timeout, DEAD_WAIT))
+    return False
+
+
+def _read_raw(timeout: float) -> bytes:
+    """Keyboard bytes, or b'' after `timeout`.  Blocks; never spins.
+
+    A signalled console may hold nothing but a resize, focus or mouse record,
+    so this can legitimately return b'' before the timeout.  That is not a
+    spin: reading consumed those records, which leaves the handle unsignalled,
+    so the next wait blocks properly.  Consuming what it wakes for is the
+    property that retired the old drain pacing.
+    """
+    if not _wait_input(timeout):
         return b""
+    if WINDOWS:
+        return _win_read_console()
     try:
         return os.read(sys.stdin.fileno(), 1024)
     except OSError:
@@ -505,6 +699,38 @@ _pending = bytearray()
 
 
 ESC_WAIT = 0.03     # how long the rest of an escape sequence has to arrive
+ESC_TRIES = 2       # ... and how many times we are willing to wait for it
+
+
+def _tail_partial(data: bytes) -> bool:
+    """True if `data` stops part-way through an escape sequence."""
+    i = data.rfind(0x1B)
+    if i < 0:
+        return False
+    tail = data[i:]
+    if len(tail) == 1:
+        return True                         # bare ESC, or the start of one
+    if tail[1] not in (0x5B, 0x4F):         # not CSI/SS3: it was ESC + a key
+        return False
+    return not any(0x40 <= b <= 0x7E for b in tail[2:])
+
+
+def _read_chunk(timeout: float) -> bytes:
+    """Keyboard bytes with any escape sequence at the tail completed.
+
+    Sequences are kept whole here, once, so that neither consumer has to time
+    the byte stream: the session forwards a chunk to the device untouched, and
+    the picker can read a trailing escape as the ESC key rather than half of
+    an arrow.  It is also what lets the parser below be a pure function --
+    the old split-across-reads bookkeeping, and the phantom keystrokes it
+    produced when it guessed wrong, have nowhere left to live.
+    """
+    data = _read_raw(timeout)
+    for _ in range(ESC_TRIES):
+        if not data or not _tail_partial(data):
+            break
+        data += _read_raw(ESC_WAIT)
+    return data
 
 
 def _sequence_end():
@@ -519,11 +745,10 @@ def _sequence_end():
 
 
 def _next_key():
-    """Pop one key token off `_pending`.
+    """Pop one key token off `_pending`, or None if what came off was not a key.
 
-    Returns None when the bytes consumed were not a key, and never consumes a
-    byte it has not identified -- half of a sequence is put back rather than
-    thrown away, which is what stops a slow arrow key arriving as a stray 'A'.
+    Pure: it never reads.  `_read_chunk` guarantees whole sequences, so an
+    escape with nothing parseable after it really was the ESC key.
     """
     if not _pending:
         return None
@@ -541,13 +766,7 @@ def _next_key():
             return f"CTRL-{chr(b + 64)}"
         return chr(b)
 
-    # An escape is either the ESC key or the start of a sequence, and only what
-    # follows tells them apart.  Give the rest a moment to turn up; if no
-    # sequence completes, the escape stood alone.
     end = _sequence_end()
-    if end is None:
-        _pending.extend(_read_raw(ESC_WAIT))
-        end = _sequence_end()
     if end is None:
         del _pending[0]
         return "ESC"
@@ -556,38 +775,47 @@ def _next_key():
     return _ARROWS.get(final)               # anything else is a report, not a key
 
 
-DRAIN = 0.005       # pace at which input that holds no keys is thrown away
+def keys(data: bytes) -> list:
+    """The key tokens in `data`, with reports and other non-keys dropped.
 
-
-def read_key(timeout: float = 0.4):
-    """Return a key token ('UP', 'ENTER', 'q', ...) or None after `timeout`.
-
-    Terminal reports -- focus in and out, cursor position, mouse -- arrive on
-    the same channel as keystrokes and are not keys.  They are dropped here so
-    that callers only ever see keys, and dropped at a fixed rate: a terminal
-    that talks continuously would otherwise be answered as fast as it can talk,
-    which is a spin.  Bytes already in hand are always parsed first, so a real
-    keystroke never waits behind the pacing.
+    Terminal reports -- focus in and out, cursor position, mouse -- share the
+    channel with keystrokes and are not keys.  Discarding them is free now:
+    the read that consumed them left the handle unsignalled, so nothing comes
+    straight back round for more.
     """
-    deadline = time.monotonic() + timeout
-    discarded = False
-    while True:
-        while _pending:
-            key = _next_key()
-            if key is not None:
-                return key
-            discarded = True
+    _pending.extend(data)
+    out = []
+    while _pending:
+        key = _next_key()
+        if key is not None:
+            out.append(key)
+    return out
 
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return None
-        if discarded:
-            _NOISE[0] += 1
-            discarded = False
-            time.sleep(min(left, DRAIN))
-            left = deadline - time.monotonic()
 
-        _pending.extend(_read_raw(max(0.0, left)))
+class KeyReader(threading.Thread):
+    """Turn keystrokes into KEY events carrying raw bytes.
+
+    Bytes, not tokens, because the session is a transparent pipe: an arrow key
+    has to reach the far-side REPL as the three bytes it came in as.  Only the
+    picker asks for tokens, and it asks `keys()` for them.
+
+    The keyboard is the one source that earns a native blocking wait -- it is
+    where the old poll lived, and every platform makes the wait cheap.
+    """
+
+    def __init__(self, bus: Bus) -> None:
+        super().__init__(daemon=True, name="key-reader")
+        self.bus = bus
+        self._quit = threading.Event()      # not _stop: see PortWatcher
+
+    def stop(self) -> None:
+        self._quit.set()
+
+    def run(self) -> None:
+        while not self._quit.is_set():
+            data = _read_chunk(TICK)
+            if data:
+                self.bus.post(KEY, data)
 
 
 # --------------------------------------------------------------------------
@@ -609,7 +837,7 @@ STARTER_CONFIG = """\
 baudrate = 115200
 # exclude = COM1, *Bluetooth*, /dev/ttyS*
 #
-# Start in a high-contrast palette instead of the default colours -- `H`
+# Start in a high-contrast palette instead of the default colours -- `h`
 # cycles the three at any time.  default | contrast-dark | contrast-light
 # theme = contrast-dark
 
@@ -693,40 +921,63 @@ class Device:
         return "-"
 
 
-SETTLE = 0.6        # let a freshly-appeared device's driver attach
-SCANNER = None
+FAST_SCAN = 0.4     # the picker is on screen: this list is what is being read
+IDLE_SCAN = 1.0     # a session is live: nobody is reading the list
+WATCHER = None
 
 
-class PortScanner(threading.Thread):
-    """Enumerate serial ports on a worker thread.
+class PortWatcher(threading.Thread):
+    """Post an event whenever the set of serial ports changes.
 
-    On Windows comports() is a full SetupAPI device-tree walk that can stall
-    for seconds while a driver attaches -- which is exactly when we call it
-    most, right after a replug.  The UI reads a cached snapshot and never
-    blocks.  Also tracks how long each device has been continuously present,
-    so auto-reconnect can wait for the driver instead of racing it.
+    A timer rather than an OS notification, deliberately.  netlink and
+    WM_DEVICECHANGE only say that *something* changed -- finding out what
+    still means calling comports() -- so the expensive part is identical and
+    all native notification buys is a lower scan rate.  This is one
+    implementation instead of three plus a hole where macOS goes, and if the
+    latency ever does matter, a native source drops in as one more producer on
+    the same bus with nothing else moving.
 
-    That walk is pure-Python ctypes, so it holds the GIL for most of its
-    duration and its cost is set by the state of the machine's device tree, not
-    by anything porter controls.  Polling it on a fixed interval therefore has
-    no upper bound: the sleep is paced off the last scan instead, which caps
-    this thread at a fixed share of one core however slow enumeration gets.
+    What makes it event-driven is the diff: the tick is an implementation
+    detail of this thread, and nothing downstream polls a snapshot.  Devices
+    appear and disappear in the picker because this said so.
+
+    comports() is a pure-Python ctypes walk of the device tree, so it holds
+    the GIL for most of its duration and its cost is set by the state of the
+    machine rather than by anything porter controls.  Hence the share guard.
     """
 
     SHARE = 8           # sleep at least this many times the last scan's cost
 
-    def __init__(self, interval: float = 0.35) -> None:
-        super().__init__(daemon=True, name="port-scanner")
-        self.interval = interval
+    def __init__(self, bus: Bus) -> None:
+        super().__init__(daemon=True, name="port-watcher")
+        self.bus = bus
+        self.interval = FAST_SCAN
         self.last_scan = 0.0        # seconds the most recent scan took
-        self._lock = threading.Lock()
-        self._ports: list = []
-        self._since: dict = {}
         self.ready = threading.Event()
+        self._ports: list = []
+        # Not _stop: threading.Thread._stop is a method join() calls, and an
+        # attribute of that name shadows it and breaks join() outright.
+        self._quit = threading.Event()
+
+    def attention(self, wanted: bool) -> None:
+        """Scan fast while the device list is on screen, slowly when it is not.
+
+        In a live session the list is unread, and the one device that matters
+        is watched far more closely than any scan could manage: its reader
+        faults the instant the cable goes.
+        """
+        self.interval = FAST_SCAN if wanted else IDLE_SCAN
+
+    def stop(self) -> None:
+        self._quit.set()
+
+    def ports(self) -> list:
+        # Rebound whole, never mutated in place, so this needs no lock.
+        return list(self._ports)
 
     def run(self) -> None:
-        since: dict = {}
-        while True:
+        seen = None
+        while not self._quit.is_set():
             started = time.monotonic()
             try:
                 ports = list(list_ports.comports())
@@ -734,35 +985,29 @@ class PortScanner(threading.Thread):
                 # Enumeration failing means "unknown", not "all unplugged":
                 # keep the last snapshot rather than report every device gone.
                 ports = None
-            now = time.monotonic()
-            self.last_scan = now - started
+            self.last_scan = time.monotonic() - started
 
             if ports is not None:
-                keys = {_identity(p) for p in ports}
-                for gone in [k for k in since if k not in keys]:
-                    del since[gone]
-                for k in keys:
-                    since.setdefault(k, now)
-                with self._lock:
-                    self._ports, self._since = ports, dict(since)
+                self._ports = ports
                 self.ready.set()
+                now_keys = {_identity(p) for p in ports}
+                if now_keys != seen:
+                    seen = now_keys
+                    self.bus.post(PORTS, ports)
 
-            time.sleep(max(self.interval, self.last_scan * self.SHARE))
-
-    def ports(self) -> list:
-        with self._lock:
-            return list(self._ports)
-
-    def age(self, key: str) -> float:
-        """Seconds this device has been continuously present, or -1.0."""
-        with self._lock:
-            first = self._since.get(key)
-        return -1.0 if first is None else time.monotonic() - first
+            # Proportional, and it must stay that way.  An absolute ceiling
+            # here reads like a bound on how stale the list can get, but
+            # because the walk holds the GIL it really puts a *floor* under
+            # this thread's duty cycle as scans get slower: a 10s enumeration
+            # under a 2s cap is 83% of a core with the GIL held, the main
+            # thread stops being scheduled, and porter locks up with a dead
+            # keyboard.  A stale list is a far smaller problem than that.
+            self._quit.wait(max(self.interval, self.last_scan * self.SHARE))
 
 
 def _scan_ports() -> list:
-    if SCANNER is not None:
-        return SCANNER.ports()
+    if WATCHER is not None:
+        return WATCHER.ports()
     return list(list_ports.comports())
 
 
@@ -897,11 +1142,6 @@ def rename_alias(path: Path, old: str, new: str) -> bool:
 # Picker
 # --------------------------------------------------------------------------
 
-POLL = 0.4
-SPINNER = "|/-\\"
-BACKLOG_MAX = 256 * 1024
-
-
 class _Cancel:
     """Sentinel: leave the picker without disturbing the live session."""
 
@@ -912,24 +1152,32 @@ CANCEL = _Cancel()
 def _text_prompt(draw, label: str, initial: str = "") -> str | None:
     """Modal one-line input drawn under the device list.  None if cancelled."""
     buf = list(initial)
+    dirty = True
     while True:
-        draw(label + "".join(buf) + "_")
+        if dirty:
+            draw(label + "".join(buf) + "_")
+            dirty = False
         _beat()
-        key = read_key(POLL)
-        if key is None:
+        kind, payload = BUS.get(POLL)
+        if kind == RX:
+            SCREEN.feed(payload)            # the picker owns the screen
             continue
-        if key == "ENTER":
-            return "".join(buf).strip()
-        if key in ("ESC", "CTRL-C"):
-            return None
-        if key == "BACK":
-            if buf:
-                buf.pop()
-        elif len(key) == 1 and key.isprintable():
-            buf.append(key)
+        if kind != KEY:
+            continue
+        for key in keys(payload):
+            if key == "ENTER":
+                return "".join(buf).strip()
+            if key in ("ESC", "CTRL-C"):
+                return None
+            if key == "BACK":
+                if buf:
+                    buf.pop()
+            elif len(key) == 1 and key.isprintable():
+                buf.append(key)
+            dirty = True
 
 
-def _render(devs, sel, fresh, waiting_label, spin, msg, cfg_path,
+def _render(devs, sel, fresh, msg, cfg_path,
             resumable=False, prompt=None) -> None:
     width = max(40, shutil.get_terminal_size((100, 30)).columns)
     rows = []
@@ -957,9 +1205,6 @@ def _render(devs, sel, fresh, waiting_label, spin, msg, cfg_path,
             rows.append(plain)
 
     rows.append("")
-    if waiting_label:
-        rows.append(f" {T.warn}{spin} waiting for {waiting_label}"
-                    f"{T.reset}{T.muted}  (any key to cancel){T.reset}")
     if msg:
         rows.append(f" {T.ok}{msg}{T.reset}")
     rows.append("")
@@ -970,27 +1215,37 @@ def _render(devs, sel, fresh, waiting_label, spin, msg, cfg_path,
     else:
         rows.append(T.muted + " j/k or arrows select  .  enter connect"
                     "  .  1-9 jump  .  b baud  .  a name" + T.reset)
-        keys = " H high contrast"
-        keys += "  .  esc resume  .  q quit" if resumable else "  .  q quit"
-        rows.append(T.muted + keys + T.reset)
+        foot = " h high contrast"
+        foot += "  .  esc resume  .  q quit" if resumable else "  .  q quit"
+        rows.append(T.muted + foot + T.reset)
         rows.append(T.muted + f" aliases: {cfg_path}" + T.reset)
 
     w(T.reset + HOME + (CLEAR_EOL + "\r\n").join(rows) + CLEAR_EOL + CLEAR_EOS)
 
 
 def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
-           preselect: str | None, waiting_for: str | None,
+           preselect: str | None, session=None,
            resumable: bool = False, show_all: bool = False):
-    """Live device list.
+    """Live device list, driven by events.
 
-    Returns a Device to connect to, CANCEL to go back to the live session,
-    or None to quit.
+    Nothing in here polls.  The loop waits on the bus, and devices appear and
+    disappear because the watcher said the port set changed -- the tick that
+    noticed lives in that thread and is not this loop's business.
+
+    Losing a device always lands here, and that is not cosmetic.  An earlier
+    version waited in place watching only the device it had lost, which made
+    anything *else* plugged in during the wait invisible and left porter
+    looking wedged with no way out but a keystroke.  The picker is already a
+    live device monitor; putting the wait anywhere else re-creates that dead
+    end.
+
+    Returns a Device to connect to, CANCEL to go back to the live session, or
+    None to quit.
     """
     devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
     known = {d.key for d in devs}
     fresh: set[str] = set()
     msg = ""
-    spin = 0
     dirty = True
 
     sel = 0
@@ -1001,125 +1256,125 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 break
 
     while True:
-        if waiting_for:
-            for d in devs:
-                if d.key != waiting_for:
-                    continue
-                # Do not pounce the instant it enumerates -- see _open_port.
-                if SCANNER is None or SCANNER.age(d.key) >= SETTLE:
-                    return d
-
         if dirty:
-            label = _waiting_label(cfg, waiting_for) if waiting_for else None
-            _render(devs, sel, fresh, label, SPINNER[spin % len(SPINNER)],
-                    msg, cfg_path, resumable)
+            _render(devs, sel, fresh, msg, cfg_path, resumable)
             dirty = False
 
         _beat()
-        key = read_key(POLL)
+        kind, payload = BUS.get(POLL)
 
-        if key is not None:
-            if waiting_for:               # any key cancels the auto-reconnect
-                waiting_for = None
-                dirty = True
-            if fresh or msg:              # the +new tag has served its purpose
+        if kind == RX:
+            SCREEN.feed(payload)        # held: the picker owns the screen
+            continue
+
+        if kind == GONE:
+            # The session died while its own scrollback was off screen.  Mark
+            # it and leave esc alone: resuming a session that is already lost
+            # reports the disconnect and lands straight back here, whereas
+            # clearing `resumable` would silently turn esc into quit.
+            if session is not None and payload == session.dev.key:
+                session.lost = True
+            continue
+
+        if kind == PORTS:
+            new_devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
+            new_keys = {d.key for d in new_devs}
+            if new_keys == known:
+                continue
+            appeared = new_keys - known
+            fresh |= appeared
+            fresh &= new_keys
+            anchor = devs[sel].key if devs and sel < len(devs) else None
+            devs = new_devs
+            if appeared:
+                # Jump to whatever was just plugged in: plug, enter, done.
+                first = next(d for d in devs if d.key in appeared)
+                sel = devs.index(first)
+            elif anchor:
+                sel = next((i for i, d in enumerate(devs)
+                            if d.key == anchor), 0)
+            sel = max(0, min(sel, len(devs) - 1)) if devs else 0
+            known = new_keys
+            msg = ""
+            dirty = True
+            continue
+
+        if kind != KEY:
+            continue
+
+        for key in keys(payload):
+            if fresh or msg:            # the +new tag has served its purpose
                 fresh, msg = set(), ""
                 dirty = True
 
-        if key is None:
-            spin += 1
-            new_devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-            new_keys = {d.key for d in new_devs}
-            if new_keys != known:
-                appeared = new_keys - known
-                fresh |= appeared
-                fresh &= new_keys
-                anchor = devs[sel].key if devs and sel < len(devs) else None
-                devs = new_devs
-                if appeared:
-                    # Jump to whatever was just plugged in: plug, enter, done.
-                    first = next(d for d in devs if d.key in appeared)
-                    sel = devs.index(first)
-                elif anchor:
-                    sel = next((i for i, d in enumerate(devs)
-                                if d.key == anchor), 0)
-                sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-                known = new_keys
-                msg = ""
+            if key in ("q", "CTRL-C"):
+                return None
+            if key == "ESC":
+                # Escape means "never mind" when there is a session to go back
+                # to, and only means quit when there is nothing behind it.
+                return CANCEL if resumable else None
+            if key in ("DOWN", "j", "TAB") and devs:
+                sel = (sel + 1) % len(devs)
                 dirty = True
-            elif waiting_for:
-                dirty = True              # keep the spinner moving
-            continue
-
-        if key in ("q", "CTRL-C"):
-            return None
-        if key == "ESC":
-            # Escape means "never mind" when there is a session to go back to,
-            # and only means quit when there is nothing behind the picker.
-            return CANCEL if resumable else None
-        if key in ("DOWN", "j", "TAB") and devs:
-            sel = (sel + 1) % len(devs)
-            dirty = True
-        elif key in ("UP", "k") and devs:
-            sel = (sel - 1) % len(devs)
-            dirty = True
-        elif key == "HOME" and devs:
-            sel, dirty = 0, True
-        elif key == "END" and devs:
-            sel, dirty = len(devs) - 1, True
-        elif key == "ENTER" and devs:
-            return devs[sel]
-        elif key and key.isdigit() and key != "0" and devs:
-            i = int(key) - 1
-            if i < len(devs):
-                return devs[i]
-        elif key == "b" and devs:
-            d = devs[sel]
-            nxt = next((x for x in BAUD_CYCLE if x > d.baud), BAUD_CYCLE[0])
-            overrides[d.key] = nxt
-            devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-            sel = next((i for i, x in enumerate(devs) if x.key == d.key), sel)
-            dirty = True
-        elif key == "a" and devs:
-            d = devs[sel]
-
-            def draw(text, _d=devs, _s=sel):
-                _render(_d, _s, fresh, None, " ", "", cfg_path, resumable, text)
-
-            name = _text_prompt(draw, "name for this device: ", d.alias or "")
-            if name is None:
-                msg = "cancelled"
-            else:
-                problem = _valid_alias(name, cfg, current=d.alias)
-                if problem:
-                    msg = problem
-                elif d.alias == name:
-                    msg = "unchanged"
-                elif d.alias:
-                    msg = (f"renamed to [{name}]" if rename_alias(cfg_path, d.alias, name)
-                           else f"could not find [{d.alias}] in {cfg_path}")
-                else:
-                    add_alias(cfg_path, name, d)
-                    msg = f"saved as [{name}] in {cfg_path}"
-                cfg, _ = load_config(cfg_path)
+            elif key in ("UP", "k") and devs:
+                sel = (sel - 1) % len(devs)
+                dirty = True
+            elif key == "HOME" and devs:
+                sel, dirty = 0, True
+            elif key == "END" and devs:
+                sel, dirty = len(devs) - 1, True
+            elif key == "ENTER" and devs:
+                return devs[sel]
+            elif key and key.isdigit() and key != "0" and devs:
+                i = int(key) - 1
+                if i < len(devs):
+                    return devs[i]
+            elif key == "b" and devs:
+                d = devs[sel]
+                nxt = next((x for x in BAUD_CYCLE if x > d.baud), BAUD_CYCLE[0])
+                overrides[d.key] = nxt
                 devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
                 sel = next((i for i, x in enumerate(devs) if x.key == d.key), sel)
+                dirty = True
+            elif key == "a" and devs:
+                d = devs[sel]
+
+                def draw(text, _d=devs, _s=sel):
+                    _render(_d, _s, fresh, "", cfg_path, resumable, text)
+
+                name = _text_prompt(draw, "name for this device: ",
+                                    d.alias or "")
+                if name is None:
+                    msg = "cancelled"
+                else:
+                    problem = _valid_alias(name, cfg, current=d.alias)
+                    if problem:
+                        msg = problem
+                    elif d.alias == name:
+                        msg = "unchanged"
+                    elif d.alias:
+                        msg = (f"renamed to [{name}]"
+                               if rename_alias(cfg_path, d.alias, name)
+                               else f"could not find [{d.alias}] in {cfg_path}")
+                    else:
+                        add_alias(cfg_path, name, d)
+                        msg = f"saved as [{name}] in {cfg_path}"
+                    cfg, _ = load_config(cfg_path)
+                    devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
+                    sel = next((i for i, x in enumerate(devs)
+                                if x.key == d.key), sel)
+                    sel = max(0, min(sel, len(devs) - 1)) if devs else 0
+                dirty = True
+            elif key == "h":
+                msg = f"theme: {next_theme()}"
+                dirty = True
+            elif key == "r":
+                cfg, _ = load_config(cfg_path)
+                devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
+                known = {d.key for d in devs}
                 sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-            dirty = True
-        elif key == "H":
-            msg = f"theme: {next_theme()}"
-            dirty = True
-        elif key == "r":
-            cfg, _ = load_config(cfg_path)
-            devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-            known = {d.key for d in devs}
-            sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-            msg = "reloaded"
-            dirty = True
-
-
-def _waiting_label(cfg, key: str) -> str:
-    return _match_alias(cfg, key) or key
+                msg = "reloaded"
+                dirty = True
 
 
 # --------------------------------------------------------------------------
@@ -1130,13 +1385,15 @@ PREFIX = 0x14  # ctrl-t, same as tio
 
 QUIT, REPICK, NEXT, LOST = "quit", "repick", "next", "lost"
 
+GRACE = 1.0       # how long a device may be missing from a scan before we act
+
 HELP = """\
  ctrl-t ?   list commands          ctrl-t c   show configuration
  ctrl-t q   quit porter            ctrl-t L   show line states
  ctrl-t d   back to device picker  ctrl-t g   toggle DTR/RTS
  ctrl-t n   next device            ctrl-t b   send break
  ctrl-t l   clear screen           ctrl-t e   toggle local echo
- ctrl-t H   high-contrast mode     ctrl-t ctrl-t   send literal ctrl-t\
+ ctrl-t h   high-contrast mode     ctrl-t ctrl-t   send literal ctrl-t\
 """
 
 
@@ -1144,8 +1401,9 @@ def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
     """Open the port, retrying while the driver settles.
 
     A device node appears in the enumeration before its driver has finished
-    attaching, so an auto-reconnect that fires 400ms after replug routinely
-    beats the driver to the port.  Retry rather than bouncing to the picker.
+    attaching, so selecting a device the moment it shows up in the picker
+    routinely beats the driver to the port.  Retry rather than reporting a
+    failure the user can only fix by pressing enter again.
     """
     last = None
     for attempt in range(1, attempts + 1):
@@ -1180,21 +1438,23 @@ class Session:
 
     It stays open while the picker is on screen, so escaping the picker
     resumes instead of reopening: reopening pulses DTR on most USB-serial
-    chips, which would reset the board out from under you.  Device output
-    that arrives while the picker is up is buffered and flushed on resume.
+    chips, which would reset the board out from under you.  Device output that
+    arrives while porter owns the screen is held by `Screen` and flushed on
+    the way back.
+
+    No locks.  The reader thread only posts to the bus, and everything that
+    touches the terminal or the held bytes happens on the main thread.
     """
 
-    def __init__(self, dev: Device) -> None:
+    def __init__(self, dev: Device, bus: Bus) -> None:
         self.dev = dev
+        self.bus = bus
         self.ser = None
         self.echo = False
+        self.lost = False       # set by whoever sees GONE first
         self._armed = False
         self._thread = None
         self._stop = threading.Event()
-        self._lost = threading.Event()
-        self._paused = False
-        self._backlog = bytearray()
-        self._lock = threading.Lock()
 
     def open(self) -> str | None:
         """Connect.  Returns None on success, or an error to report."""
@@ -1217,46 +1477,48 @@ class Session:
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
                 # Wedged in a native read.  Leaking one handle is strictly
-                # safer than closing it out from under the thread.
+                # safer than closing it out from under the thread -- and a
+                # thread leaked *blocked* holds no lock and no GIL, which is
+                # the whole reason the empty-read wait below matters.
                 note("serial reader did not stop; leaking that handle", T.warn)
 
-    def pause(self) -> None:
-        with self._lock:
-            self._paused = True
-
     def resume(self) -> None:
-        with self._lock:
-            self._paused = False
-            held, self._backlog = bytes(self._backlog), bytearray()
-        note(f"back on {self.dev.label}"
-             + (f" (+{len(held)} bytes buffered)" if held else ""))
-        if held:
-            w_bytes(held)
+        """Come back from the picker, naming the device we returned to.
+
+        Silent when the device went while the picker was up: run() is about to
+        report the disconnect, and "back on X" immediately above "X
+        disconnected" reads like porter lost track of what happened.
+        """
+        held = SCREEN.release()
+        if not self.lost:
+            note(f"back on {self.dev.label}"
+                 + (f" (+{len(held)} bytes buffered)" if held else ""))
+        _flush(held)
 
     def _read_loop(self) -> None:
+        """Read the device and post it.  Never touches the terminal."""
         try:
             while not self._stop.is_set():
+                started = time.monotonic()
                 try:
                     data = self.ser.read(self.ser.in_waiting or 1)
                 except Exception:
                     # A yanked handle surfaces as SerialException, OSError or
                     # AttributeError on a None handle -- all mean the same.
-                    self._lost.set()
+                    self.bus.post(GONE, self.dev.key)
                     return
-                if not data or self._stop.is_set():
-                    continue
-                with self._lock:
-                    if self._paused:
-                        self._backlog.extend(data)
-                        if len(self._backlog) > BACKLOG_MAX:
-                            del self._backlog[:-BACKLOG_MAX]
-                        data = b""
                 if data:
-                    try:
-                        w_bytes(data)
-                    except Exception:
-                        self._stop.set()
-                        return
+                    self.bus.post(RX, data)
+                    continue
+                # An empty read must still cost its timeout.  A handle whose
+                # device has gone can return empty the instant it is called,
+                # and then this loop is a spin that holds the GIL -- and a
+                # reader that will not stop is leaked rather than joined, so
+                # one dead port could starve the main thread for the rest of
+                # the run.  Wait out the remainder either way.
+                idle = self.ser.timeout - (time.monotonic() - started)
+                if idle > 0:
+                    self._stop.wait(idle)
         finally:
             # The reader closes its own port.  Closing from the main thread
             # while a ReadFile is in flight lets Windows recycle the handle
@@ -1265,41 +1527,59 @@ class Session:
                 self.ser.close()
 
     def run(self) -> str:
-        """Pump the keyboard until something interesting happens."""
+        """Wait on the bus until something takes us out of the session."""
+        if self.lost:
+            note(f"{self.dev.label} disconnected", T.warn)
+            return LOST
+
         reason = QUIT
-        next_check = time.monotonic() + 1.0
-        misses = 0
+        absent_since = None
         try:
             while True:
-                if self._lost.is_set():
+                kind, payload = BUS.get(TICK)
+                now = time.monotonic()
+                _beat()
+                _TOAST.tick(now)
+
+                # Checked every time round, not only on a timeout: a device
+                # that vanished from the port list while still producing
+                # output would otherwise never come up for judgement.
+                if absent_since is not None and now - absent_since >= GRACE:
                     reason = LOST
                     break
 
-                # Backstop: Linux can return empty reads forever, and a
-                # removed device does not always raise.
-                now = time.monotonic()
-                if now >= next_check:
-                    next_check = now + 1.0
-                    present = any(_identity(p) == self.dev.key
-                                  for p in _scan_ports())
-                    misses = 0 if present else misses + 1
-                    if misses >= 2:
-                        reason = LOST
-                        break
-
-                _beat()
-                data = _read_raw(0.05)
-                if not data:
+                if kind == RX:
+                    SCREEN.feed(payload)
+                    continue
+                if kind == GONE:
+                    self.lost = True
+                    reason = LOST
+                    break
+                if kind == PORTS:
+                    # Backstop for a device that stops answering without ever
+                    # faulting: Linux can return empty reads for ever.  The
+                    # snapshot is edge-triggered, so absence is news -- but
+                    # give it a moment, because a driver reshuffling can drop
+                    # a device from one enumeration and put it back.
+                    present = any(_identity(p) == self.dev.key for p in payload)
+                    absent_since = None if present else (absent_since or now)
+                    continue
+                if kind is None:
                     continue
 
+                # A key chunk.  Bytes, so an arrow reaches the far side whole.
+                # The ack has to come down before the keystroke is echoed, or
+                # the erase would take back the echo instead.
+                _TOAST.clear()
                 outgoing = bytearray()
-                for b in data:
+                for b in payload:
                     if self._armed:
                         self._armed = False
-                        cmd = _command(b, self.ser, self.dev, outgoing)
+                        cmd = _command(b, self, outgoing)
                         if cmd == "echo":
                             self.echo = not self.echo
-                            note(f"local echo {'on' if self.echo else 'off'}")
+                            toast(f"local echo "
+                                  f"{'on' if self.echo else 'off'}")
                         elif cmd:
                             reason = cmd
                             raise _Done
@@ -1315,7 +1595,7 @@ class Session:
                         reason = LOST
                         break
                     if self.echo:
-                        w_bytes(bytes(outgoing))
+                        SCREEN.feed(bytes(outgoing))
         except _Done:
             pass
 
@@ -1328,15 +1608,59 @@ class _Done(Exception):
     """Break out of the nested byte loop."""
 
 
-def _command(b: int, ser, dev: Device, outgoing: bytearray):
-    """Handle one ctrl-t command byte.  Returns a session reason, or None."""
+# A page is modal, so it holds the device off the screen for as long as it is
+# up.  Backstop the wait: walking away from an open help page would otherwise
+# hold output until BACKLOG_MAX and start dropping the oldest of it.
+PAGE_SECS = 60.0
+
+
+def _page(body: str, hint: str = "any key to resume",
+          timeout: float = PAGE_SECS) -> bytes:
+    """Answer a question about porter on a page the scrollback never sees.
+
+    Modal, like the picker: keys typed while it is up belong to the page and
+    do not reach the device.  Output is held rather than dropped and flushed
+    into the main buffer on the way out, so the page costs the log nothing.
+    """
+    _TOAST.clear()
+    SCREEN.hold()
+    try:
+        with alt_screen():
+            w(HOME + body.replace("\n", "\r\n")
+              + "\r\n\r\n" + T.muted + " " + hint + T.reset)
+            deadline = time.monotonic() + timeout
+            while True:
+                _beat()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return b""
+                kind, payload = BUS.get(min(TICK, left))
+                if kind == RX:
+                    SCREEN.feed(payload)
+                elif kind == KEY:
+                    return payload
+                elif kind == GONE:
+                    BUS.post(GONE, payload)     # not this loop's to consume
+                    return b""
+    finally:
+        _flush(SCREEN.release())
+
+
+def _command(b: int, sess, outgoing: bytearray):
+    """Handle one ctrl-t command byte.  Returns a session reason, or None.
+
+    Where the answer goes is the rule: what porter did to the wire or to the
+    connection is a note, in the scrollback; what porter has to say about
+    itself is a page or a toast, and leaves no trace in the capture.
+    """
     ch = chr(b) if 0x20 <= b < 0x7F else ""
+    ser, dev = sess.ser, sess.dev
 
     if b == PREFIX:
         outgoing.append(PREFIX)
         return None
     if ch == "?":
-        w("\r\n" + T.muted + HELP.replace("\n", "\r\n") + T.reset + "\r\n")
+        _page(T.muted + HELP + T.reset)
     elif ch == "q":
         return QUIT
     elif ch == "d":
@@ -1352,18 +1676,26 @@ def _command(b: int, ser, dev: Device, outgoing: bytearray):
             ser.send_break(0.25)
         note("break sent")
     elif ch == "c":
-        note(f"{dev.label}  {dev.port}  {dev.baud} 8N1  "
-             f"id={dev.key}  dtr={ser.dtr} rts={ser.rts}")
+        rows = [("device", dev.label), ("port", dev.port),
+                ("baud", f"{dev.baud} 8N1"), ("id", dev.key),
+                ("lines", f"dtr={ser.dtr} rts={ser.rts}"),
+                ("theme", T.name), ("echo", "on" if sess.echo else "off")]
+        _page("".join(f" {T.muted}{k:<8}{T.reset}{v}\n" for k, v in rows))
     elif ch == "L":
+        # A reading off the wire, not a fact about porter: it belongs in the log.
         try:
             note(f"cts={ser.cts} dsr={ser.dsr} ri={ser.ri} cd={ser.cd}")
         except (OSError, serial.SerialException) as exc:
             note(f"line states unavailable: {exc}", T.err)
-    elif ch == "H":
-        note(f"theme: {next_theme()}")
+    elif ch == "h":
+        toast(f"theme: {next_theme()}")
     elif ch == "g":
-        note("toggle which line?  d=DTR  r=RTS")
-        pick = _read_raw(3.0)
+        pick = _page(f" {T.bold}toggle which line?{T.reset}\n\n"
+                     f" {T.bold}d{T.reset}   DTR is currently "
+                     f"{'high' if ser.dtr else 'low'}\n"
+                     f" {T.bold}r{T.reset}   RTS is currently "
+                     f"{'high' if ser.rts else 'low'}",
+                     "any other key cancels", 10.0)
         if pick[:1] == b"d":
             ser.dtr = not ser.dtr
             note(f"DTR {'high' if ser.dtr else 'low'}")
@@ -1371,7 +1703,7 @@ def _command(b: int, ser, dev: Device, outgoing: bytearray):
             ser.rts = not ser.rts
             note(f"RTS {'high' if ser.rts else 'low'}")
         else:
-            note("cancelled")
+            toast("cancelled")          # nothing happened, so log nothing
     else:
         # Unknown command: pass both bytes through untouched.
         outgoing.append(PREFIX)
@@ -1407,8 +1739,6 @@ def main(argv=None) -> int:
                     help="also show ports with no USB id (COM1, Bluetooth, ...)")
     ap.add_argument("--list", action="store_true",
                     help="list devices with their stable ids, then exit")
-    ap.add_argument("--no-reconnect", action="store_true",
-                    help="do not wait for a disconnected device to return")
     ap.add_argument("--debug", nargs="?", const="porter-debug.log", metavar="LOG",
                     help="log a full thread dump if the main loop ever stalls")
     args = ap.parse_args(argv)
@@ -1441,37 +1771,45 @@ def main(argv=None) -> int:
         _start_watchdog(args.debug)
         print(f"porter: watchdog logging to {args.debug}")
 
-    global SCANNER
-    SCANNER = PortScanner()
-    SCANNER.start()
-    SCANNER.ready.wait(timeout=3.0)
+    global WATCHER
+    WATCHER = PortWatcher(BUS)
+    WATCHER.start()
+    WATCHER.ready.wait(timeout=3.0)
 
     overrides: dict = {}
     last_key = None
-    waiting = None
     next_dev = None
     current = None          # the live Session, or None
 
     with RawTerm():
+        reader = KeyReader(BUS)
+        reader.start()
         try:
             set_theme(start_theme)
 
             while True:
                 if next_dev is None:
                     cfg, _ = load_config(path)
-                    if current is not None:
-                        current.pause()
-                    with alt_screen():
-                        choice = picker(cfg, path, overrides, args.baud,
-                                        last_key, waiting,
-                                        resumable=current is not None,
-                                        show_all=args.all)
-                    waiting = None
-                    if choice is None:
-                        break
+                    _TOAST.clear()
+                    SCREEN.hold()       # the picker owns the screen now
+                    WATCHER.attention(True)
+                    try:
+                        with alt_screen():
+                            choice = picker(
+                                cfg, path, overrides, args.baud, last_key,
+                                current,
+                                resumable=(current is not None
+                                           and not current.lost),
+                                show_all=args.all)
+                    finally:
+                        WATCHER.attention(False)
+
                     if choice is CANCEL:
-                        current.resume()
+                        current.resume()        # releases the hold, and says so
                     else:
+                        SCREEN.release()        # switching or quitting: drop it
+                        if choice is None:
+                            break
                         next_dev = choice
 
                 if next_dev is not None:
@@ -1479,7 +1817,7 @@ def main(argv=None) -> int:
                         current.close()
                         current = None
                     dev, next_dev = next_dev, None
-                    fresh = Session(dev)
+                    fresh = Session(dev, BUS)
                     err = fresh.open()
                     if err:
                         note(f"cannot open {dev.port}: {err}", T.err)
@@ -1499,12 +1837,16 @@ def main(argv=None) -> int:
                     else:
                         note("no other device", T.warn)
                 elif reason == LOST:
-                    gone = current.dev.key
+                    # Always back to the picker: whatever else is plugged in
+                    # stays visible, so losing one device is never a dead end.
                     current.close()
                     current = None
-                    if not args.no_reconnect:
-                        waiting = gone
         finally:
+            # Join before RawTerm restores the console: a reader still inside
+            # a wait can call arm_console() on a failure, and doing that after
+            # the restore would hand the terminal back in raw mode.
+            reader.stop()
+            reader.join(timeout=1.0)
             if current is not None:
                 current.close()
             w(CUR_SHOW + SGR0 + (_OSC_RESET if T.fg else "") + "\r\n")

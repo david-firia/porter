@@ -4,7 +4,8 @@ import os, pty, re, subprocess, sys, time, pathlib, fcntl, termios, struct
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FLAG = pathlib.Path("/tmp/porter_present"); CFG = "/tmp/porter_stress_config"
-pathlib.Path(CFG).unlink(missing_ok=True); FLAG.write_text("")
+FLAG_B = pathlib.Path("/tmp/porter_present_b")
+pathlib.Path(CFG).unlink(missing_ok=True); FLAG.write_text(""); FLAG_B.write_text("")
 
 socats = [subprocess.Popen(["socat", f"pty,raw,echo=0,link=/tmp/porter_{a}",
                             f"pty,raw,echo=0,link=/tmp/porter_{b}"], stderr=subprocess.DEVNULL)
@@ -59,6 +60,11 @@ for i in range(1, N+1):
     if not expect(f"  disconnect {i}", r"CircuitPython disconnected"): break
     time.sleep(0.4)
     FLAG.write_text("")
+    # Nothing reconnects on its own.  Losing the device landed in the picker,
+    # and a device that appears there is selected for you -- so replug then
+    # enter is the whole reconnect, and this exercises that path per cycle.
+    if not expect(f"  reappears {i}", r"\+new"): break
+    os.write(master, b"\r")
     if not expect(f"  reconnect {i}", r"CircuitPython on /tmp/porter_a @ 115200"): break
     time.sleep(0.3)
 
@@ -70,7 +76,9 @@ dev = os.open("/tmp/porter_b", os.O_RDWR | os.O_NOCTTY); os.set_blocking(dev, Fa
 os.write(dev, b"still alive\r\n"); time.sleep(0.4)
 expect("data flows after churn", r"still alive")
 os.write(master, b"\x14c")
-expect("ctrl-t still responsive", r"id=239a:80f4:TESTBOARD1")
+expect("ctrl-t still responsive", r"239a:80f4:TESTBOARD1")
+os.write(master, b"\r")            # the config page is modal; close it
+expect("config page closes", r"\x1b\[\?1049l")
 
 # hard failure: yank the pty out from under the reader
 print("socat killed mid-session")

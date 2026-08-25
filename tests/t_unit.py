@@ -17,6 +17,26 @@ class P:  # stand-in for ListPortInfo
         self.serial_number, self.location = serial_number, location
         self.description = description or device
 
+# BaseException, not Exception: the watcher deliberately swallows any
+# Exception out of comports(), so a sentinel deriving from Exception
+# would be caught there and the run loop would never end.
+class _Stop(BaseException): pass
+def _stop(): raise _Stop
+
+@contextlib.contextmanager
+def mock(obj, name, value):
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
+
+class _Clock:
+    """monotonic() that advances by `cost` across every comports() call."""
+    def __init__(self, cost): self.t, self.cost = 1000.0, cost
+    def monotonic(self): return self.t
+
 print("identity")
 check("full", porter._identity(P("COM14", 0x239a, 0x80f4, "DF62AA")), "239a:80f4:DF62AA")
 check("no-serial-has-location", porter._identity(P("COM7", 0x0403, 0x6001, None, "1-4.2")), "0403:6001@1-4.2")
@@ -162,56 +182,70 @@ check("binary passes through untouched", strip(binary), binary)
 
 print("key parsing")
 
-def keys(*chunks, timeout=0.05):
-    """Feed keyboard bytes through read_key until it reports a timeout."""
-    queue = list(chunks)
+def toks(*chunks):
+    """Feed whole chunks through the parser, as _read_chunk delivers them."""
     porter._pending.clear()
-    porter._read_raw = lambda _t: queue.pop(0) if queue else b""
     out = []
-    while True:
-        k = porter.read_key(timeout)
-        if k is None:
-            return out
-        out.append(k)
+    for c in chunks:
+        out += porter.keys(c)
+    return out
 
-check("plain characters", keys(b"abc"), ["a", "b", "c"])
-check("enter and tab", keys(b"\r\t"), ["ENTER", "TAB"])
-check("control byte", keys(b"\x14"), ["CTRL-T"])
-check("arrows", keys(b"\x1b[A\x1b[B\x1b[D"), ["UP", "DOWN", "LEFT"])
-check("ss3 arrow", keys(b"\x1bOA"), ["UP"])
-check("lone esc", keys(b"\x1b"), ["ESC"])
-check("esc then key", keys(b"\x1bz"), ["ESC", "z"])
-check("focus reports are not keys", keys(b"\x1b[I\x1b[O"), [])
-check("mouse report is not a key", keys(b"\x1b[<0;9;3M"), [])
-check("key survives surrounding reports", keys(b"\x1b[Iq\x1b[O"), ["q"])
+check("plain characters", toks(b"abc"), ["a", "b", "c"])
+check("enter and tab", toks(b"\r\t"), ["ENTER", "TAB"])
+check("control byte", toks(b"\x14"), ["CTRL-T"])
+check("arrows", toks(b"\x1b[A\x1b[B\x1b[D"), ["UP", "DOWN", "LEFT"])
+check("ss3 arrow", toks(b"\x1bOA"), ["UP"])
+check("lone esc", toks(b"\x1b"), ["ESC"])
+check("esc then key", toks(b"\x1bz"), ["ESC", "z"])
+check("focus reports are not keys", toks(b"\x1b[I\x1b[O"), [])
+check("mouse report is not a key", toks(b"\x1b[<0;9;3M"), [])
+check("key survives surrounding reports", toks(b"\x1b[Iq\x1b[O"), ["q"])
+check("a report storm yields no keys", toks(b"\x1b[I" * 200), [])
 check("truncated sequence does not eat the next key",
-      keys(b"\x1b[1;", b"", b"x"), ["ESC", "[", "1", ";", "x"])
-check("sequence split across reads", keys(b"\x1b[", b"A"), ["UP"])
-check("sequence split right after esc", keys(b"\x1b", b"[B"), ["DOWN"])
-check("report split across reads is still not a key",
-      keys(b"\x1b[", b"Iq"), ["q"])
+      toks(b"\x1b[1;", b"x"), ["ESC", "[", "1", ";", "x"])
 
-# A terminal talking continuously must not turn a caller's poll into a spin:
-# read_key owns the deadline, so it returns None only once the timeout is up.
-porter._read_raw = lambda _t: b"\x1b[I"
-porter._pending.clear()
-t0 = time.monotonic()
-storm = porter.read_key(0.2)
-check("report storm returns nothing", storm, None)
-check("report storm still honours the timeout",
-      time.monotonic() - t0 >= 0.2, True)
+# Splits are healed once, in _read_chunk, so the parser above never has to
+# time the byte stream -- which is what lets it be a pure function.
+print("chunks arrive whole")
 
-class _Stop(Exception): pass
-def _stop(): raise _Stop
+check("tail: incomplete csi", porter._tail_partial(b"x\x1b[1;"), True)
+check("tail: complete csi", porter._tail_partial(b"x\x1b[1;2H"), False)
+check("tail: bare esc", porter._tail_partial(b"\x1b"), True)
+check("tail: esc plus a key", porter._tail_partial(b"\x1bz"), False)
+check("tail: no esc at all", porter._tail_partial(b"abc"), False)
 
-@contextlib.contextmanager
-def mock(obj, name, value):
-    old = getattr(obj, name)
-    setattr(obj, name, value)
-    try:
-        yield
-    finally:
-        setattr(obj, name, old)
+def chunked(*pieces):
+    """_read_chunk against a keyboard handing over exactly these pieces."""
+    q = list(pieces)
+    with mock(porter, "_read_raw", lambda _t: q.pop(0) if q else b""):
+        return porter._read_chunk(0.05)
+
+check("whole sequence passes straight through", chunked(b"\x1b[A"), b"\x1b[A")
+check("sequence split across reads is completed",
+      chunked(b"\x1b[", b"A"), b"\x1b[A")
+check("split right after esc is completed",
+      chunked(b"\x1b", b"[B"), b"\x1b[B")
+check("a lone esc is not waited on for ever", chunked(b"\x1b"), b"\x1b")
+check("plain bytes need no completion", chunked(b"abc"), b"abc")
+check("a healed split parses as one key",
+      toks(chunked(b"\x1b[", b"A")), ["UP"])
+
+# The one rule the blocking wait must keep: a wait that *fails* still costs
+# time.  A dead console handle fails instantly, and a wait that returns
+# instantly for ever is the same pegged core the old poll was.
+print("a failed wait still costs time")
+
+with mock(porter, "_wait_input", lambda _t: False):
+    check("nothing ready means no bytes", porter._read_raw(0.01), b"")
+
+if not porter.WINDOWS:
+    slept = []
+    def _boom(*a, **k): raise OSError("handle gone")
+    with mock(porter.select, "select", _boom), \
+         mock(porter.time, "sleep", slept.append):
+        ready = porter._wait_input(1.0)
+    check("a wait that cannot wait reports nothing ready", ready, False)
+    check("... and does not come straight back", slept, [porter.DEAD_WAIT])
 
 print("suspend recovery")
 
@@ -224,35 +258,130 @@ with mock(porter, "arm_console", lambda: armed.append(1)):
     porter._beat()
     check("a tick gap re-arms the console", armed, [1])
 
-print("port scanner pacing")
+print("port watcher pacing")
 
-class _Clock:
-    """monotonic() that advances by `cost` across every comports() call."""
-    def __init__(self, cost): self.t, self.cost = 1000.0, cost
-    def monotonic(self): return self.t
-
-def pacing(cost, interval=0.35):
+def pacing(cost, interval=porter.FAST_SCAN):
     clock = _Clock(cost)
     slept = []
-    scanner = porter.PortScanner(interval)
+    watcher = porter.PortWatcher(porter.Bus())
+    watcher.interval = interval
     def comports():
         clock.t += cost
         return []
+    def waited(s):
+        slept.append(s)
+        raise _Stop
+    watcher._quit.wait = waited
     with mock(porter.list_ports, "comports", comports), \
-         mock(porter.time, "monotonic", clock.monotonic), \
-         mock(porter.time, "sleep", lambda s: slept.append(s) or _stop()):
+         mock(porter.time, "monotonic", clock.monotonic):
         try:
-            scanner.run()
+            watcher.run()
         except _Stop:
             pass
-    return scanner.last_scan, slept[0]
+    return watcher.last_scan, slept[0]
 
 cost, slept = pacing(0.01)
 check("cheap scan sleeps the interval", (round(cost, 3), round(slept, 3)),
-      (0.01, 0.35))
+      (0.01, round(porter.FAST_SCAN, 3)))
 cost, slept = pacing(0.5)
 check("slow scan backs off to keep its share", (round(cost, 3), round(slept, 3)),
       (0.5, 4.0))
+cost, slept = pacing(5.0)
+check("backoff stays proportional for a very slow scan",
+      (round(cost, 3), round(slept, 3)), (5.0, 40.0))
+
+# What makes it event-driven rather than polled: the tick is private to the
+# watcher, and only a *change* in the port set leaves the thread.
+print("the watcher posts changes, not snapshots")
+
+def posted(*snapshots):
+    bus = porter.Bus()
+    watcher = porter.PortWatcher(bus)
+    seq = list(snapshots)
+    def comports():
+        if not seq:
+            raise _Stop
+        return seq.pop(0)
+    watcher._quit.wait = lambda _s: None
+    with mock(porter.list_ports, "comports", comports):
+        try:
+            watcher.run()
+        except _Stop:
+            pass
+    out = []
+    while True:
+        kind, payload = bus.get(0)
+        if kind is None:
+            return out
+        out.append(sorted(p.device for p in payload))
+
+A, B = P("/dev/ttyA", 0x1, 0x2, "AA"), P("/dev/ttyB", 0x3, 0x4, "BB")
+check("an unchanged port set posts once, not every tick",
+      posted([A], [A], [A]), [["/dev/ttyA"]])
+check("an arrival posts", posted([A], [A, B]),
+      [["/dev/ttyA"], ["/dev/ttyA", "/dev/ttyB"]])
+check("a departure posts", posted([A, B], [A]),
+      [["/dev/ttyA", "/dev/ttyB"], ["/dev/ttyA"]])
+check("an empty first scan still posts", posted([]), [[]])
+
+# Enumeration failing means "unknown", not "everything unplugged".
+def flaky():
+    bus = porter.Bus()
+    watcher = porter.PortWatcher(bus)
+    seq = [[A], Exception, [A]]
+    def comports():
+        if not seq:
+            raise _Stop
+        nxt = seq.pop(0)
+        if nxt is Exception:
+            raise OSError("enumeration failed")
+        return nxt
+    watcher._quit.wait = lambda _s: None
+    with mock(porter.list_ports, "comports", comports):
+        try:
+            watcher.run()
+        except _Stop:
+            pass
+    out = []
+    while True:
+        kind, payload = bus.get(0)
+        if kind is None:
+            return out
+        out.append(sorted(p.device for p in payload))
+
+check("a failed enumeration reports nothing at all", flaky(), [["/dev/ttyA"]])
+
+print("the bus")
+
+bus = porter.Bus()
+check("an empty bus times out", bus.get(0.01), (None, None))
+bus.post(porter.KEY, b"q")
+bus.post(porter.RX, b"hi")
+check("events come back in order", [bus.get(0.01), bus.get(0.01)],
+      [(porter.KEY, b"q"), (porter.RX, b"hi")])
+
+print("the screen holds device output while porter owns it")
+
+written = []
+scr = porter.Screen()
+with mock(porter, "w_bytes", written.append):
+    scr.feed(b"a")
+    check("unheld output goes straight out", written, [b"a"])
+    scr.hold()
+    scr.feed(b"bc")
+    check("held output does not", written, [b"a"])
+    check("releasing hands back what was held", scr.release(), b"bc")
+    scr.hold(); scr.hold()
+    scr.feed(b"d")
+    check("a nested hold keeps holding", scr.release(), b"")
+    check("... until the last one lifts", scr.release(), b"d")
+    check("an unbalanced release cannot go negative", scr.release(), b"")
+
+scr = porter.Screen()
+scr.hold()
+scr.feed(b"x" * (porter.BACKLOG_MAX + 500))
+check("the hold is bounded, and keeps the newest",
+      len(scr.release()), porter.BACKLOG_MAX)
 
 print()
 if fails:

@@ -158,11 +158,12 @@ recognised across replugs even when Windows renumbers it.
    2  jlink-uart             COM7           1366:1051   460800
 
  j/k or arrows select  .  enter connect  .  1-9 jump  .  b baud  .  a name
- H high contrast  .  q quit
+ h high contrast  .  q quit
 ```
 
-- Polls every 400ms. A device that **just appeared** is tagged `+new` and the selection
-  jumps to it — plug in the board, press enter.
+- **The list is live.** A device that **just appeared** is tagged `+new` and the
+  selection jumps to it — plug in the board, press enter. Arrivals and departures
+  reach the picker as events; it never polls a snapshot of its own.
 - Runs on the alternate screen buffer, so bouncing between picker and session leaves
   your device scrollback intact.
 - `a` prompts for a name and saves it as an alias, keyed to the device's USB identity.
@@ -172,7 +173,10 @@ recognised across replugs even when Windows renumbers it.
   picker is up, so resuming cannot reset your board, and device output that arrives
   meanwhile is buffered and flushed when you return. With no session behind it, `esc`
   exits. `q` always exits.
-- `H` cycles the high-contrast themes, same key as in a session.
+- **Losing a device always lands here**, with everything else still plugged in
+  visible and selectable. Nothing reconnects on its own: a board that comes back
+  is tagged `+new` and selected, so replug-then-enter is the whole reconnect.
+- `h` cycles the high-contrast themes, same key as in a session.
 - Ports with no USB vid:pid (motherboard COM1/COM2, Bluetooth SPP, virtual sniffer
   bridges) are hidden. `--all` or `show_all = true` reveals them, and any port you have
   explicitly aliased is always shown — that is how you keep a real RS-232 port in the
@@ -181,7 +185,7 @@ recognised across replugs even when Windows renumbers it.
 ## In-session keys
 
 Borrowed from [tio](https://github.com/tio/tio), so muscle memory transfers both ways.
-`d`, `n` and `H` are additions, on keys tio leaves unused.
+`d`, `n` and `h` are additions, on keys tio leaves unused.
 
 | Key | Action | | Key | Action |
 |---|---|---|---|---|
@@ -190,7 +194,7 @@ Borrowed from [tio](https://github.com/tio/tio), so muscle memory transfers both
 | `ctrl-t d` | **back to device picker** | | `ctrl-t g` | toggle DTR/RTS |
 | `ctrl-t n` | **next device** | | `ctrl-t b` | send break |
 | `ctrl-t l` | clear screen | | `ctrl-t e` | toggle local echo |
-| `ctrl-t H` | **high-contrast mode** | | `ctrl-t ctrl-t` | send a literal ctrl-t |
+| `ctrl-t h` | **high-contrast mode** | | `ctrl-t ctrl-t` | send a literal ctrl-t |
 
 Everything else reaches the device untouched — including `ctrl-c`, which matters when
 you are talking to a CircuitPython REPL.
@@ -198,8 +202,8 @@ you are talking to a CircuitPython REPL.
 ## High contrast
 
 Sunlight eats the default palette: dim greys vanish, and mid-tone colours stop being
-distinguishable from each other or from the background. `H` — in the picker or as
-`ctrl-t H` in a session — cycles
+distinguishable from each other or from the background. `h` — in the picker or as
+`ctrl-t h` in a session — cycles
 
     default  ->  contrast-dark  ->  contrast-light  ->  default
 
@@ -275,6 +279,42 @@ Copy `porter.fragment.json` there as `porter.json`, drop the `$help` key, and se
 directory). A bare `porter` works too, but only once PATH has caught up — which it has
 not if Windows Terminal was already running when you installed.
 
+## How it stays responsive
+
+Every source porter reacts to runs on its own thread and posts to one queue. The
+main loop's only wait is a `get()` on that queue.
+
+| Source | How it waits |
+|---|---|
+| keyboard | native blocking wait — `WaitForSingleObject` on Windows, `select` elsewhere |
+| device output | blocking read on the serial port |
+| the port list | a timer in the watcher thread, which posts only when the set of ports *changes* |
+
+Two properties fall out of that shape, and both are the point:
+
+- **It cannot deadlock.** The queue is unbounded, so a post never blocks and no
+  producer ever waits on the consumer; only the main loop waits on the queue, and
+  nothing holds it while waiting. The wait-for graph is a star with every edge
+  pointing at the queue, so no cycle is expressible.
+- **No loop spins.** Nothing polls a snapshot. The one place that could still
+  burn a core is a *failed* wait — a console handle that a sleep/wake cycle
+  killed answers instantly instead of waiting — so a wait that could not wait
+  sleeps a fixed floor before trying again, and re-arms the console on its way.
+
+The device list is the one thing on a timer rather than an OS notification. That
+is deliberate: `WM_DEVICECHANGE` and netlink only say that *something* changed, so
+finding out what still costs a full `comports()` walk. Native notification would
+only lower the scan rate, at the price of three platform implementations and a
+gap where macOS goes. The watcher scans fast while the picker is on screen and
+slowly behind a live session, where nobody is reading the list and a lost device
+is noticed by its reader faulting long before any scan.
+
+Because that walk is pure-Python ctypes and holds the GIL, the watcher's sleep is
+kept *proportional* to what the last scan cost. That is a cost bound, not a
+staleness bound: an absolute ceiling on it would put a floor under the thread's
+duty cycle as scans get slower, and a stale device list is a far smaller problem
+than a UI that cannot be quit.
+
 ## Troubleshooting
 
 `--debug` starts a watchdog. It writes a health line once a minute, and dumps
@@ -286,23 +326,25 @@ because neither leaves anything on screen:
 
 A line reads:
 
-    14:22:01  3 ticks/s, 0 non-key reads/s, port scan 41ms
+    14:22:01  5 ticks/s, port scan 41ms
 
-`ticks/s` is how often the main loop came round: 2-3 while the picker is up, ~20
-in a live session. `non-key reads/s` counts input the terminal sent that held no
-keystroke -- focus and mouse reports. `port scan` is what one enumeration of the
-serial ports cost; on Windows that is a full device-tree walk, and the scanner
-paces itself off it, so a slow one shows up as devices taking longer to appear
-rather than as CPU.
+`ticks/s` is how often the main loop came round. It waits on the event queue, so
+this is a timer floor rather than a measure of load, and a number far above it
+means something is generating events in a loop. `port scan` is what one
+enumeration of the serial ports cost; on Windows that is a full device-tree walk,
+and the watcher paces itself off it, so a slow one shows up as devices taking
+longer to appear rather than as CPU.
 
 ## Tests
 
 - `tests/t_unit.py` -- identity, alias matching, baud precedence, sort stability,
-  theme cycling, the device-colour filter, key parsing, suspend recovery and
-  port-scanner pacing.
+  theme cycling, the device-colour filter, key parsing, escape-sequence healing,
+  the blocking wait's failure floor, suspend recovery, the event bus, the output
+  hold, and port-watcher pacing and change detection.
 - `tests/t_integ.py` -- drives the real program under a pty against socat-backed
-  virtual serial ports: picker, data flow, every `ctrl-t` command, hotplug,
-  auto-reconnect.
+  virtual serial ports: picker, data flow, every `ctrl-t` command, hotplug, loss
+  landing in the picker, and a second device staying reachable while one is
+  missing.
 - `tests/t_stress.py` -- repeated unplug/replug cycles, orphan-thread leak check,
   and killing the pty out from under a live reader.
 - `tests/t_ui.py` -- esc-resume with output buffering, alias naming and renaming,
