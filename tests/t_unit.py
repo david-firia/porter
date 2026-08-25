@@ -1,5 +1,5 @@
 """Unit tests for porter's pure logic -- no tty, no hardware."""
-import sys, types, tempfile, pathlib, configparser, contextlib, io, time
+import sys, types, tempfile, pathlib, configparser, contextlib, io, time, threading
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import porter
 
@@ -359,6 +359,275 @@ bus.post(porter.KEY, b"q")
 bus.post(porter.RX, b"hi")
 check("events come back in order", [bus.get(0.01), bus.get(0.01)],
       [(porter.KEY, b"q"), (porter.RX, b"hi")])
+
+# post_rx queues a signal only when one is not already outstanding, and only
+# take_rx() clears that.  So a loop that takes an RX event off the queue and
+# then returns without claiming the bytes mutes the bus for good -- every
+# later post_rx sees a signal still outstanding and queues nothing.  That is a
+# live port and a dead screen, which is what a disconnect/reconnect used to
+# leave behind.
+print("the rx signal is re-armed by taking the bytes")
+
+bus = porter.Bus()
+bus.post_rx(b"one")
+check("first output signals", bus.get(0.01), (porter.RX, None))
+bus.post_rx(b"two")
+check("a signal already outstanding does not re-signal", bus.get(0.01),
+      (None, None))
+check("taking claims everything since the last take", bus.take_rx(), (b"onetwo", 0))
+bus.post_rx(b"three")
+check("and re-arms the signal", bus.get(0.01), (porter.RX, None))
+
+
+print("a session hands the rx signal back however it ends")
+
+LAST = b'last words\r\n'
+def _noop(*a, **k): pass
+
+for name, wind_up in (
+        ("lost to a faulted reader",
+         lambda b, d: b.post(porter.GONE, sess)),
+        ("sent back to the picker",
+         lambda b, d: b.post(porter.KEY, bytes([porter.PREFIX]) + b"d")),
+        ("quit",
+         lambda b, d: b.post(porter.KEY, bytes([porter.PREFIX]) + b"q"))):
+    bus = porter.Bus()
+    dev = porter.Device(port="COM9", key="239a:80f4:X", label="board",
+                        baud=115200)
+    sess = porter.Session(dev, bus)
+    painted = []
+    with mock(porter, "BUS", bus), mock(porter, "w", _noop):
+        with mock(porter, "w_bytes", painted.append):
+            # The device's last words and the event that ends the session
+            # land in the same drain pass -- the normal case, since the read
+            # that faults follows the read that returned data.
+            bus.post_rx(LAST)
+            wind_up(bus, dev)
+            sess.run()
+            check(f"{name}: the last words still reach the screen",
+                  b"".join(painted), LAST)
+            bus.post_rx(b"I am back")
+            check(f"{name}: the next session's output still signals",
+                  bus.get(0.01), (porter.RX, None))
+
+
+# Coalescing bounds how much output is outstanding, not how often porter
+# writes.  A terminal that keeps up is therefore the dangerous case: the loop
+# free-runs, each pass takes back a few bytes, and porter is back to one
+# write+flush per read -- which is what saturated a Windows console until
+# flush() stopped returning and took the keyboard down with it.  Measured at
+# 3123 passes/sec against a real board before this was bounded.
+# close() says outright that it can leave a reader behind, and a leaked
+# reader faults whenever its driver gets round to it -- long after the session
+# that owned it is over.  Keyed by device it is indistinguishable from the
+# live session's own reader, because a replug of the same board carries the
+# same key.  That would kill a healthy session on every reconnect.
+# A daemon thread that dies takes a whole faculty with it and leaves nothing
+# on screen: a dead keyboard, or a device list frozen for the rest of the run.
+print("a background thread survives what it runs into")
+
+porter.FAULTS.clear()
+
+class _Boom:
+    """A port object that blows up where the watcher used to be unguarded."""
+    device = "COM9"
+    @property
+    def vid(self): raise RuntimeError("backend went sideways")
+
+watcher = porter.PortWatcher(porter.Bus())
+
+def _one_scan():
+    watcher._quit.set()                   # this pass is the only one
+    return [_Boom()]
+
+with mock(porter.list_ports, "comports", _one_scan):
+    watcher.run()                         # must return, not raise
+check("a scan that blows up in the diff does not kill the watcher",
+      len(porter.FAULTS), 1)
+check("... and says what happened", "backend went sideways" in porter.FAULTS[0],
+      True)
+
+porter.FAULTS.clear()
+reader = porter.KeyReader(porter.Bus())
+calls = [0]
+def _explode(_timeout):
+    calls[0] += 1
+    if calls[0] >= 2:
+        reader._quit.set()                # let it out on the second pass
+    raise OSError("console handle went away")
+
+with mock(porter, "_read_chunk", _explode), mock(porter, "DEAD_WAIT", 0.0):
+    reader.run()                          # must return, not raise
+check("a keyboard read that raises does not kill the reader", calls[0], 2)
+check("... and each attempt is recorded", len(porter.FAULTS), 2)
+
+porter.FAULTS.clear()
+
+
+# The reader owns closing its own handle, so one that would not stop keeps the
+# port open -- and the bare "access is denied" that follows reads like a
+# broken device rather than something porter is still holding.
+print("a port held by a leaked reader explains itself")
+
+held = porter.Device(port="COM77", key="k", label="board", baud=115200)
+alive = threading.Event()
+stuck = threading.Thread(target=alive.wait, daemon=True, name="stuck-reader")
+stuck.start()
+porter._LEAKED[held.port] = stuck
+
+check("a live leak is reported", porter._holder("COM77") is stuck, True)
+check("an unrelated port is not", porter._holder("COM78"), None)
+
+sess = porter.Session(held, porter.Bus())
+with mock(porter, "_open_port", lambda d: (None, PermissionError("Access is denied"))):
+    with mock(porter, "note", _noop):
+        err = sess.open()
+check("the failure names the holder", "did not stop when the device went" in err,
+      True)
+check("and still carries the underlying error", "Access is denied" in err, True)
+
+alive.set(); stuck.join(timeout=2.0)
+check("a leak that lets go is forgotten", porter._holder("COM77"), None)
+check("... and stops being reported", porter._LEAKED.get("COM77"), None)
+
+
+print("a session dies only on its own reader's fault")
+
+bus = porter.Bus()
+dev = porter.Device(port="COM9", key="239a:80f4:X", label="board", baud=115200)
+dead = porter.Session(dev, bus)         # the session that was lost
+live = porter.Session(dev, bus)         # its replacement, same board, same key
+
+def _quit_soon():
+    time.sleep(0.25)
+    bus.post(porter.KEY, bytes([porter.PREFIX]) + b"q")
+
+with mock(porter, "BUS", bus), mock(porter, "w", _noop):
+    with mock(porter, "w_bytes", _noop):
+        bus.post(porter.GONE, dead)     # the leak finally faults
+        threading.Thread(target=_quit_soon, daemon=True).start()
+        reason = live.run()
+
+check("a leaked reader's fault does not end the live session",
+      reason, porter.QUIT)
+check("... and does not mark it lost", live.lost, False)
+
+bus = porter.Bus()
+live = porter.Session(dev, bus)
+with mock(porter, "BUS", bus), mock(porter, "w", _noop):
+    with mock(porter, "w_bytes", _noop):
+        bus.post(porter.GONE, live)
+        check("its own reader's fault still ends it", live.run(), porter.LOST)
+check("... and marks it lost", live.lost, True)
+
+
+print("a flood is painted at a bounded rate, not once per read")
+
+BPS = 115200 // 10          # ~11.5 KB/s, one 8N1 byte per 10 bits
+CHUNK = 4                   # what a read() hands back on a live line
+RUN = 0.5
+
+bus = porter.Bus()
+dev = porter.Device(port="COM9", key="239a:80f4:X", label="board", baud=115200)
+sess = porter.Session(dev, bus)
+writes, sent = [], [0]
+flooding = threading.Event()
+flooding.set()
+
+def _flood():
+    # sleep(), not a spin.  A real reader sits in ReadFile with the GIL
+    # released, and that is what lets the main loop free-run between
+    # arrivals; a spinning producer holds the GIL and hides the bug outright.
+    while flooding.is_set():
+        bus.post_rx(b"x" * CHUNK)
+        sent[0] += CHUNK
+        time.sleep(CHUNK / BPS)
+
+def _stopper():
+    time.sleep(RUN)
+    bus.post(porter.KEY, bytes([porter.PREFIX]) + b"q")
+
+with mock(porter, "BUS", bus), mock(porter, "w", _noop):
+    with mock(porter, "w_bytes", lambda d: writes.append(len(d))):
+        threading.Thread(target=_flood, daemon=True).start()
+        threading.Thread(target=_stopper, daemon=True).start()
+        started = time.monotonic()
+        reason = sess.run()
+        elapsed = time.monotonic() - started
+        flooding.clear()
+
+rate = len(writes) / elapsed
+chunk = sum(writes) / len(writes)
+# Absolute, not derived from PAINT_MIN: a ceiling that moves with the thing
+# under test cannot fail.  60/s is the design rate; a real console died at
+# ~3000/s, so anything under 300 is comfortably safe and comfortably strict.
+ceiling = 300
+
+check("the keystroke still lands under a flood", reason, porter.QUIT)
+check(f"the write rate stays bounded ({rate:.0f}/s, ceiling {ceiling:.0f}/s)",
+      rate < ceiling, True)
+check(f"and the chunks stay fat ({chunk:.0f} bytes, not {CHUNK})",
+      chunk > 4 * CHUNK, True)
+check("no output is lost on the way", sum(writes), sent[0])
+
+
+# The picker and a page own the screen, so held output never reaches the
+# console and cannot saturate it -- but claiming the RX signal the moment it
+# arrives re-arms it, the reader posts again at once, and the loop free-runs
+# at the reader's rate for no benefit.  Caught at 316 passes/sec with a page
+# open over a chatty board.  SPIN exists to say no loop belongs there.
+print("a loop that owns the screen does not spin on a chatty device")
+
+BPS = 115200 // 10
+CHUNK = 4
+
+def _flooded(run_loop, secs=0.4):
+    """Run `run_loop` against a wire-paced device; return passes/sec."""
+    bus = porter.Bus()
+    flooding = threading.Event()
+    flooding.set()
+
+    def _flood():
+        while flooding.is_set():
+            bus.post_rx(b"x" * CHUNK)
+            time.sleep(CHUNK / BPS)
+
+    def _stopper():
+        time.sleep(secs)
+        bus.post(porter.KEY, b"q")
+
+    screen = porter.Screen()
+    screen.hold()
+    with mock(porter, "BUS", bus), mock(porter, "SCREEN", screen):
+        with mock(porter, "w", _noop), mock(porter, "w_bytes", _noop):
+            threading.Thread(target=_flood, daemon=True).start()
+            threading.Thread(target=_stopper, daemon=True).start()
+            porter._TICK[1] = 0
+            started = time.monotonic()
+            run_loop(bus)
+            elapsed = time.monotonic() - started
+    flooding.clear()
+    return porter._TICK[1] / elapsed, bus
+
+def _page_loop(bus):
+    porter._page("body", timeout=5.0)
+
+rate, bus = _flooded(_page_loop)
+check(f"a page waits rather than spins ({rate:.0f}/s, spin is {porter.SPIN}/s)",
+      rate < porter.SPIN, True)
+bus.post_rx(b"more")
+check("a page re-arms the signal on the way out", bus.get(0.01),
+      (porter.RX, None))
+
+def _picker_loop(bus):
+    with mock(porter, "_scan_ports", lambda: []):
+        porter.picker(configparser.ConfigParser(), pathlib.Path("nowhere"),
+                      {}, None, None)
+
+rate, bus = _flooded(_picker_loop)
+check(f"the picker waits rather than spins ({rate:.0f}/s)",
+      rate < porter.SPIN, True)
+
 
 print("the screen holds device output while porter owns it")
 

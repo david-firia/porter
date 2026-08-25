@@ -171,6 +171,39 @@ came out of that, and both must hold:
    and the device's, which is the right trade: the reorder window is one
    iteration and only opens when the device is already outrunning the
    terminal.
+3. **A paint is never sooner than `PAINT_MIN` after the last one.** Rules 1
+   and 2 are not enough on their own, and this is the subtle part: coalescing
+   bounds how much output is *outstanding*, not how often porter *writes*. A
+   terminal that keeps up is therefore the dangerous case, not the safe one --
+   the loop free-runs, `take_rx()` hands back whatever landed since the last
+   pass, and at 115200 baud that is about four bytes. Rule 1 still holds and
+   porter is still back to one `write()`+`flush()` per read.
+
+   That is not hypothetical: it is how the bug came back. A board replugged
+   mid-session put the main loop at 3123 passes/sec, and then `flush()` simply
+   stopped returning -- pinned there for over a minute, with the reader,
+   watcher and key-reader threads all healthy and a keyboard that was dead
+   only because nobody was left to drain the bus. Deferring keeps the chunks
+   fat: same bytes, ~47x fewer console round-trips, one frame of latency.
+
+   While a paint is deferred the bus goes quiet by itself -- the RX signal is
+   still outstanding, so the reader queues nothing and just keeps merging --
+   and the loop shortens its own `BUS.get()` timeout to wake for it. Covered
+   by "a flood is painted at a bounded rate" in `t_unit.py`, whose producer
+   `sleep()`s rather than spins: a producer that holds the GIL starves the
+   main loop and hides this bug completely.
+
+A loop that *owns* the screen -- the picker, a page -- has nothing to paint,
+and claims the signal on its own timeout rather than the moment it arrives.
+Held output never reaches the console so it cannot saturate anything, but
+`take_rx()` re-arms the signal, the reader posts again at once, and the loop
+free-runs at the reader's rate for no benefit whatever. Caught at 316
+passes/sec with a page open over a chatty board -- harmless, and still past
+`SPIN`, which exists to say no loop has a reason to be there. `_claim_rx()` is
+the one place that knows this, and every exit from those loops goes through it
+in a `finally`: a signal left outstanding is never re-armed, which is the
+live-port-dead-screen bug again, and the picker alone has half a dozen ways
+out.
 
 `RX_MAX` bounds what has arrived but is not yet painted, because a device can
 outrun any terminal indefinitely and the queue is unbounded by design. Past it
@@ -181,8 +214,11 @@ which fails loudly against the version that queued per read.
 
 Painting is still on the main thread, so a terminal that stops accepting
 output entirely -- a Windows console with a selection active, for instance --
-still blocks porter, quit included. If that turns out to matter, the fix is a
-painter thread owning stdout, not a lock around `w_bytes`.
+still blocks porter, quit included. Rule 3 removes porter's own ability to
+*cause* that by saturation, which is what the replug lockup turned out to be,
+but it does not cover a console wedged from the outside. If that turns out to
+matter, the fix is a painter thread owning stdout, not a lock around
+`w_bytes`.
 
 ### A failed wait must still cost time
 
@@ -245,6 +281,32 @@ leaked *spinning* is not. That asymmetry is why the rule exists.
 has finished. An `Event` attribute of that name shadows it and `join()` raises
 `TypeError` instead of joining. `PortWatcher` and `KeyReader` use `_quit`.
 
+### A background thread may not die, and may not die quietly
+
+`KeyReader` and `PortWatcher` catch everything their loop body can raise, and
+neither is allowed to fall out of `run()`. This is not general defensiveness:
+these two threads each own a whole faculty, and losing one is
+indistinguishable from a lockup by the only test that matters -- what the user
+sees. A dead `KeyReader` is a keyboard that stopped working. A dead
+`PortWatcher` is a device list frozen for the rest of the run, in a picker
+whose entire job is to be live. Neither leaves a mark on screen.
+
+The watcher's guard has to cover **the diff, not just the scan**.
+`comports()` was already wrapped; `_identity()` was not, and it reads
+attributes off whatever the platform backend happened to build.
+
+What they catch goes in `FAULTS`, and the main loop drains it -- `note()` in a
+session, the message line in the picker, which owns its own display. Two
+things follow from where that lives:
+
+- **It is a deque, not a bus event.** A fault must not be lost, and an event
+  consumed by a modal page would be. `maxlen` makes append and popleft atomic,
+  so it needs no lock and cannot join the wait graph.
+- **A recovering thread still has to cost time.** `KeyReader` sleeps
+  `DEAD_WAIT` after a fault. A caught exception that costs nothing is the same
+  pegged core as a failed wait that returns instantly -- see above; it is the
+  same rule, and catching rather than crashing does not exempt you from it.
+
 ## Losing a device lands in the picker, and nothing reconnects by itself
 
 **Losing a device always lands in the picker.** This is the important property,
@@ -266,6 +328,25 @@ What replaces it costs nothing: a device that appears in the picker is tagged
 reconnect. `Session.lost` is the only remnant -- it lets a session that died
 while the picker was up report the disconnect rather than resume, so `esc`
 still means "never mind" and never silently becomes quit.
+
+### `GONE` names the session, not the device
+
+`close()` says outright that it can leave a reader behind. A leaked reader
+faults whenever its driver gets round to it -- long after the session that
+owned it is over -- and it posts `GONE` when it does. Keyed by device that is
+indistinguishable from the *live* session's own reader, because a replug of
+the same board carries the same key, which is exactly the case porter is built
+around. So the payload is the `Session` object and both consumers compare
+identity: a session ends only on its own reader's fault.
+
+### A port the last reader still holds says so
+
+The reader owns closing its own handle, so one that would not stop keeps the
+port open, and every reopen fails with a bare "access is denied" that reads
+like a broken device. It is not -- it is porter still holding it. `close()`
+records the thread in `_LEAKED`, `_holder()` forgets it once it lets go, and
+the open failure names it. Same rule as the dropped-byte count: a failure that
+says why is worth far more than one that does not.
 
 
 ## When adding a command

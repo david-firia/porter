@@ -14,6 +14,7 @@ Single file; pyserial is the only dependency.
 from __future__ import annotations
 
 import argparse
+import collections
 import configparser
 import contextlib
 import faulthandler
@@ -132,6 +133,27 @@ _OSC_RESET = "\x1b]110\x07\x1b]111\x07"
 T = THEMES["default"]
 
 
+# What a background thread ran into, newest last, plus a running total for the
+# watchdog's health line.  A daemon thread that dies quietly is the worst
+# failure porter has: a keyboard that stopped working, or a device list that
+# stopped updating, is indistinguishable from a lockup and leaves nothing on
+# screen to explain itself.  So the threads survive and record here instead.
+#
+# A deque with a maxlen appends and pops atomically, so this needs no lock and
+# cannot join the wait graph.  It is drained on the main loop rather than
+# posted to the bus because a fault must not be lost, and an event consumed by
+# a modal page would be -- and because a deque check on a loop that is already
+# awake is not a wait, a syscall, or a snapshot anybody polls.
+FAULTS = collections.deque(maxlen=20)
+_FAULT_COUNT = [0]
+
+
+def _fault(exc: BaseException) -> None:
+    """Record a background-thread exception.  Never touches the terminal."""
+    _FAULT_COUNT[0] += 1
+    FAULTS.append(f"{threading.current_thread().name}: {exc!r}")
+
+
 _TICK = [time.monotonic(), 0]   # last beat, and beats since the watchdog looked
 SUSPEND = 4.0                   # a tick gap this long means we were not running
 SPIN = 200                      # ticks per second no loop has a reason to reach
@@ -172,6 +194,8 @@ def _start_watchdog(path: str, stall: float = 8.0) -> None:
             _TICK[1] = 0
             scan = WATCHER.last_scan if WATCHER is not None else 0.0
             health = f"{ticks} ticks/s, port scan {scan * 1000:.0f}ms"
+            if _FAULT_COUNT[0]:
+                health += f", {_FAULT_COUNT[0]} thread faults"
 
             trouble = None
             if behind > stall:
@@ -276,6 +300,12 @@ KEY, RX, GONE, PORTS = "key", "rx", "gone", "ports"
 
 TICK = 0.2          # how often a waiting loop wakes to check the clock
 POLL = 0.4          # picker idle wake-up
+
+# Floor under the gap between two paints of device output.  Coalescing bounds
+# how much is outstanding; this is what bounds how *often* porter writes, and
+# without it a fast terminal is the dangerous case rather than the safe one --
+# see Session._paint().
+PAINT_MIN = 1 / 60
 
 
 class Bus:
@@ -406,6 +436,25 @@ SCREEN = Screen()
 def _flush(data: bytes) -> None:
     if data:
         w_bytes(data)
+
+
+def _claim_rx() -> None:
+    """Move what the device has said into the hold, and re-arm the RX signal.
+
+    For the loops that own the screen -- the picker and a page.  They have
+    nothing to paint, so they do not claim the signal the moment it arrives:
+    an outstanding signal is what keeps the reader from queueing more, and
+    claiming it every time is a loop that free-runs at the reader's post rate
+    for no benefit at all.  Observed at 316 passes/sec with a page open over a
+    chatty board -- harmless, because held output never reaches the console,
+    but `SPIN` exists to say no loop has a reason to be there.
+
+    So they claim on their own timeout instead, and unconditionally on the way
+    out.  The way out is the part that matters: a signal left outstanding when
+    the loop returns is never re-armed, and the next session's output is never
+    announced.  Same rule as Session._paint(), same reason.
+    """
+    SCREEN.feed(BUS.take_rx()[0])
 
 
 TOAST_SECS = 1.5
@@ -864,7 +913,18 @@ class KeyReader(threading.Thread):
 
     def run(self) -> None:
         while not self._quit.is_set():
-            data = _read_chunk(TICK)
+            try:
+                data = _read_chunk(TICK)
+            except Exception as exc:
+                # This thread dying is a keyboard that stopped working with
+                # nothing on screen to say why -- the one failure porter
+                # cannot tell apart from a lockup.  Record it and carry on:
+                # a failed wait re-arms the console, so the next pass may
+                # well succeed.  DEAD_WAIT because a failure that costs no
+                # time is a spin, same rule as _wait_input.
+                _fault(exc)
+                time.sleep(DEAD_WAIT)
+                continue
             if data:
                 self.bus.post(KEY, data)
 
@@ -1038,13 +1098,21 @@ class PortWatcher(threading.Thread):
                 ports = None
             self.last_scan = time.monotonic() - started
 
-            if ports is not None:
-                self._ports = ports
-                self.ready.set()
-                now_keys = {_identity(p) for p in ports}
-                if now_keys != seen:
-                    seen = now_keys
-                    self.bus.post(PORTS, ports)
+            try:
+                if ports is not None:
+                    self._ports = ports
+                    self.ready.set()
+                    now_keys = {_identity(p) for p in ports}
+                    if now_keys != seen:
+                        seen = now_keys
+                        self.bus.post(PORTS, ports)
+            except Exception as exc:
+                # The scan is guarded above; the diff was not.  _identity()
+                # reads attributes off whatever the platform backend built,
+                # and this thread dying there would freeze the device list
+                # for the rest of the run -- a picker that never updates,
+                # with nothing to say why.
+                _fault(exc)
 
             # Proportional, and it must stay that way.  An absolute ceiling
             # here reads like a bound on how stale the list can get, but
@@ -1306,126 +1374,147 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 sel = i
                 break
 
-    while True:
-        if dirty:
-            _render(devs, sel, fresh, msg, cfg_path, resumable)
-            dirty = False
+    try:
+        while True:
+            if dirty:
+                _render(devs, sel, fresh, msg, cfg_path, resumable)
+                dirty = False
 
-        _beat()
-        kind, payload = BUS.get(POLL)
-
-        if kind == RX:
-            SCREEN.feed(BUS.take_rx()[0])   # held: the picker owns the screen
-            continue
-
-        if kind == GONE:
-            # The session died while its own scrollback was off screen.  Mark
-            # it and leave esc alone: resuming a session that is already lost
-            # reports the disconnect and lands straight back here, whereas
-            # clearing `resumable` would silently turn esc into quit.
-            if session is not None and payload == session.dev.key:
-                session.lost = True
-            continue
-
-        if kind == PORTS:
-            new_devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-            new_keys = {d.key for d in new_devs}
-            if new_keys == known:
+            _beat()
+            if FAULTS:
+                # note() would write straight through the picker's own display;
+                # the message line is where the picker says things.
+                msg = FAULTS.popleft()
+                dirty = True
                 continue
-            appeared = new_keys - known
-            fresh |= appeared
-            fresh &= new_keys
-            anchor = devs[sel].key if devs and sel < len(devs) else None
-            devs = new_devs
-            if appeared:
-                # Jump to whatever was just plugged in: plug, enter, done.
-                first = next(d for d in devs if d.key in appeared)
-                sel = devs.index(first)
-            elif anchor:
-                sel = next((i for i, d in enumerate(devs)
-                            if d.key == anchor), 0)
-            sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-            known = new_keys
-            msg = ""
-            dirty = True
-            continue
+            kind, payload = BUS.get(POLL)
 
-        if kind != KEY:
-            continue
+            if kind == RX:
+                # Held, so there is nothing to paint and no reason to claim the
+                # signal yet: leaving it outstanding is what keeps the reader
+                # from queueing more and this loop off the CPU.  Claimed on the
+                # next pass -- the bus is quiet now, so that is the POLL timeout.
+                continue
+            _claim_rx()
 
-        for key in keys(payload):
-            if fresh or msg:            # the +new tag has served its purpose
-                fresh, msg = set(), ""
+            if kind == GONE:
+                # The session died while its own scrollback was off screen.  Mark
+                # it and leave esc alone: resuming a session that is already lost
+                # reports the disconnect and lands straight back here, whereas
+                # clearing `resumable` would silently turn esc into quit.
+                if session is not None and payload is session:
+                    session.lost = True
+                continue
+
+            if kind == PORTS:
+                new_devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
+                new_keys = {d.key for d in new_devs}
+                if new_keys == known:
+                    continue
+                appeared = new_keys - known
+                fresh |= appeared
+                fresh &= new_keys
+                anchor = devs[sel].key if devs and sel < len(devs) else None
+                devs = new_devs
+                if appeared:
+                    # Jump to whatever was just plugged in: plug, enter, done.
+                    first = next(d for d in devs if d.key in appeared)
+                    sel = devs.index(first)
+                elif anchor:
+                    sel = next((i for i, d in enumerate(devs)
+                                if d.key == anchor), 0)
+                sel = max(0, min(sel, len(devs) - 1)) if devs else 0
+                known = new_keys
+                msg = ""
                 dirty = True
+                continue
 
-            if key in ("q", "CTRL-C"):
-                return None
-            if key == "ESC":
-                # Escape means "never mind" when there is a session to go back
-                # to, and only means quit when there is nothing behind it.
-                return CANCEL if resumable else None
-            if key in ("DOWN", "j", "TAB") and devs:
-                sel = (sel + 1) % len(devs)
-                dirty = True
-            elif key in ("UP", "k") and devs:
-                sel = (sel - 1) % len(devs)
-                dirty = True
-            elif key == "HOME" and devs:
-                sel, dirty = 0, True
-            elif key == "END" and devs:
-                sel, dirty = len(devs) - 1, True
-            elif key == "ENTER" and devs:
-                return devs[sel]
-            elif key and key.isdigit() and key != "0" and devs:
-                i = int(key) - 1
-                if i < len(devs):
-                    return devs[i]
-            elif key == "b" and devs:
-                d = devs[sel]
-                nxt = next((x for x in BAUD_CYCLE if x > d.baud), BAUD_CYCLE[0])
-                overrides[d.key] = nxt
-                devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-                sel = next((i for i, x in enumerate(devs) if x.key == d.key), sel)
-                dirty = True
-            elif key == "a" and devs:
-                d = devs[sel]
+            if kind != KEY:
+                continue
 
-                def draw(text, _d=devs, _s=sel):
-                    _render(_d, _s, fresh, "", cfg_path, resumable, text)
+            for key in keys(payload):
+                if fresh or msg:            # the +new tag has served its purpose
+                    fresh, msg = set(), ""
+                    dirty = True
 
-                name = _text_prompt(draw, "name for this device: ",
-                                    d.alias or "")
-                if name is None:
-                    msg = "cancelled"
-                else:
-                    problem = _valid_alias(name, cfg, current=d.alias)
-                    if problem:
-                        msg = problem
-                    elif d.alias == name:
-                        msg = "unchanged"
-                    elif d.alias:
-                        msg = (f"renamed to [{name}]"
-                               if rename_alias(cfg_path, d.alias, name)
-                               else f"could not find [{d.alias}] in {cfg_path}")
-                    else:
-                        add_alias(cfg_path, name, d)
-                        msg = f"saved as [{name}] in {cfg_path}"
-                    cfg, _ = load_config(cfg_path)
+                if key in ("q", "CTRL-C"):
+                    return None
+                if key == "ESC":
+                    # Escape means "never mind" when there is a session to go back
+                    # to, and only means quit when there is nothing behind it.
+                    return CANCEL if resumable else None
+                if key in ("DOWN", "j", "TAB") and devs:
+                    sel = (sel + 1) % len(devs)
+                    dirty = True
+                elif key in ("UP", "k") and devs:
+                    sel = (sel - 1) % len(devs)
+                    dirty = True
+                elif key == "HOME" and devs:
+                    sel, dirty = 0, True
+                elif key == "END" and devs:
+                    sel, dirty = len(devs) - 1, True
+                elif key == "ENTER" and devs:
+                    return devs[sel]
+                elif key and key.isdigit() and key != "0" and devs:
+                    i = int(key) - 1
+                    if i < len(devs):
+                        return devs[i]
+                elif key == "b" and devs:
+                    d = devs[sel]
+                    nxt = next((x for x in BAUD_CYCLE if x > d.baud),
+                               BAUD_CYCLE[0])
+                    overrides[d.key] = nxt
                     devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
                     sel = next((i for i, x in enumerate(devs)
                                 if x.key == d.key), sel)
+                    dirty = True
+                elif key == "a" and devs:
+                    d = devs[sel]
+
+                    def draw(text, _d=devs, _s=sel):
+                        _render(_d, _s, fresh, "", cfg_path, resumable, text)
+
+                    name = _text_prompt(draw, "name for this device: ",
+                                        d.alias or "")
+                    if name is None:
+                        msg = "cancelled"
+                    else:
+                        problem = _valid_alias(name, cfg, current=d.alias)
+                        if problem:
+                            msg = problem
+                        elif d.alias == name:
+                            msg = "unchanged"
+                        elif d.alias:
+                            msg = (
+                                f"renamed to [{name}]"
+                                if rename_alias(cfg_path, d.alias, name)
+                                else f"could not find [{d.alias}] "
+                                     f"in {cfg_path}")
+                        else:
+                            add_alias(cfg_path, name, d)
+                            msg = f"saved as [{name}] in {cfg_path}"
+                        cfg, _ = load_config(cfg_path)
+                        devs = enumerate_devices(cfg, overrides, cli_baud,
+                                                 show_all)
+                        sel = next((i for i, x in enumerate(devs)
+                                    if x.key == d.key), sel)
+                        sel = max(0, min(sel, len(devs) - 1)) if devs else 0
+                    dirty = True
+                elif key == "h":
+                    msg = f"theme: {next_theme()}"
+                    dirty = True
+                elif key == "r":
+                    cfg, _ = load_config(cfg_path)
+                    devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
+                    known = {d.key for d in devs}
                     sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-                dirty = True
-            elif key == "h":
-                msg = f"theme: {next_theme()}"
-                dirty = True
-            elif key == "r":
-                cfg, _ = load_config(cfg_path)
-                devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-                known = {d.key for d in devs}
-                sel = max(0, min(sel, len(devs) - 1)) if devs else 0
-                msg = "reloaded"
-                dirty = True
+                    msg = "reloaded"
+                    dirty = True
+    finally:
+        # However we leave -- with a device, with CANCEL, or to quit -- the
+        # RX signal is claimed.  One left outstanding is never re-armed, and
+        # the next session's output is never announced.  See _claim_rx().
+        _claim_rx()
 
 
 # --------------------------------------------------------------------------
@@ -1446,6 +1535,25 @@ HELP = """\
  ctrl-t l   clear screen           ctrl-t e   toggle local echo
  ctrl-t h   high-contrast mode     ctrl-t ctrl-t   send literal ctrl-t\
 """
+
+
+# Readers that would not stop, by port.  The reader owns closing its own
+# handle -- see Session._read_loop -- so a leaked one keeps the port open, and
+# every attempt to reopen it fails with a bare "access is denied" that reads
+# like the device is broken.  It is not: something porter did is still holding
+# it.  A failure that says so is worth far more than one that does not.
+_LEAKED: dict = {}
+
+
+def _holder(port: str):
+    """The thread from an earlier session still holding `port`, or None."""
+    thread = _LEAKED.get(port)
+    if thread is None:
+        return None
+    if not thread.is_alive():
+        _LEAKED.pop(port, None)     # it let go; there is nothing to explain
+        return None
+    return thread
 
 
 def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
@@ -1503,6 +1611,7 @@ class Session:
         self.ser = None
         self.echo = False
         self.lost = False       # set by whoever sees GONE first
+        self._said = 0.0        # last time we admitted to dropping output
         self._armed = False
         self._thread = None
         self._stop = threading.Event()
@@ -1511,6 +1620,9 @@ class Session:
         """Connect.  Returns None on success, or an error to report."""
         ser, err = _open_port(self.dev)
         if ser is None:
+            if _holder(self.dev.port) is not None:
+                return (f"{err} - still held by this porter's own reader, "
+                        "which did not stop when the device went")
             return str(err)
         self.ser = ser
         self._thread = threading.Thread(target=self._read_loop, daemon=True,
@@ -1531,7 +1643,9 @@ class Session:
                 # safer than closing it out from under the thread -- and a
                 # thread leaked *blocked* holds no lock and no GIL, which is
                 # the whole reason the empty-read wait below matters.
-                note("serial reader did not stop; leaking that handle", T.warn)
+                _LEAKED[self.dev.port] = self._thread
+                note(f"serial reader for {self.dev.port} did not stop; "
+                     "leaking that handle", T.warn)
 
     def resume(self) -> None:
         """Come back from the picker, naming the device we returned to.
@@ -1556,7 +1670,13 @@ class Session:
                 except Exception:
                     # A yanked handle surfaces as SerialException, OSError or
                     # AttributeError on a None handle -- all mean the same.
-                    self.bus.post(GONE, self.dev.key)
+                    #
+                    # The session, not the device key: close() can leave a
+                    # reader behind that faults long afterwards, and on a
+                    # replug of the same board it would carry the very same
+                    # key.  Identity is the only thing that tells the two
+                    # apart, and mistaking them kills a healthy session.
+                    self.bus.post(GONE, self)
                     return
                 if data:
                     self.bus.post_rx(data)
@@ -1576,6 +1696,37 @@ class Session:
             # value, and the orphan then reads the next session's port.
             with contextlib.suppress(Exception):
                 self.ser.close()
+
+    def _paint(self, now: float) -> None:
+        """Put everything the device has said on screen.
+
+        Every exit from run() comes through here, and that is the point.
+        take_rx() is what re-arms the RX signal: the bus queues a signal only
+        when one is not already outstanding, and only take_rx() clears that.
+        An event that ends the session -- GONE, or ctrl-t d -- can be drained
+        in the same pass as the device's last words, and returning without
+        claiming them leaves the signal outstanding for ever.  The *next*
+        session then posts output that is never announced, and porter sits
+        there with a live port and a dead screen.
+
+        Painting them is also simply right: they are the last thing the board
+        said before it went, which is exactly what the log is for.
+
+        The caller rate-limits this to PAINT_MIN, and that is not a polish
+        item.  Coalescing bounds how much output is outstanding, not how often
+        porter writes -- so a terminal that keeps up is the dangerous case,
+        not the safe one: the loop free-runs, take_rx() hands back a few bytes
+        each pass, and porter is back to thousands of write+flush pairs a
+        second.  That saturates a Windows console until flush() stops
+        returning at all, and since painting is on the main thread the
+        keyboard goes with it.  Observed: 3123 passes/sec, then a permanent
+        block in flush().  Deferring is what keeps the chunks fat.
+        """
+        data, dropped = BUS.take_rx()
+        if dropped and now - self._said > 2.0:
+            self._said = now
+            note(f"terminal fell behind; dropped {dropped} bytes", T.warn)
+        SCREEN.feed(data)
 
     def _typed(self, data: bytes):
         """Hand one chunk of keyboard bytes to the device and to the command
@@ -1612,18 +1763,30 @@ class Session:
     def run(self) -> str:
         """Wait on the bus until something takes us out of the session."""
         if self.lost:
+            self._paint(time.monotonic())
             note(f"{self.dev.label} disconnected", T.warn)
             return LOST
 
         reason = QUIT
         absent_since = None
-        said = 0.0              # last time we admitted to dropping output
+        due = False             # an RX signal taken off the bus, not yet painted
+        next_paint = 0.0
         try:
             while True:
-                first = BUS.get(TICK)
+                # A deferred paint is the only thing that shortens the wait,
+                # and while it is deferred the bus stays quiet: the signal is
+                # still outstanding, so the reader queues nothing and just
+                # keeps merging.  That is what turns a flood into one fat
+                # write per frame instead of a write per read.
+                wait = TICK
+                if due:
+                    wait = min(wait, max(0.0, next_paint - time.monotonic()))
+                first = BUS.get(wait)
                 now = time.monotonic()
                 _beat()
                 _TOAST.tick(now)
+                while FAULTS:
+                    note(f"background thread: {FAULTS.popleft()}", T.err)
 
                 # Checked every time round, not only on a timeout: a device
                 # that vanished from the port list while still producing
@@ -1639,13 +1802,14 @@ class Session:
                 # between porter's own lines and the device's -- worth it,
                 # because the reorder window is one iteration and only opens
                 # when the device is already outrunning the terminal.
-                paint = False
                 for kind, payload in BUS.drain(first):
                     if kind is None:
                         continue
                     if kind == RX:
-                        paint = True
+                        due = True
                     elif kind == GONE:
+                        if payload is not self:
+                            continue    # a reader some earlier session leaked
                         self.lost = True
                         reason = LOST
                         raise _Done
@@ -1665,15 +1829,15 @@ class Session:
                             reason = out
                             raise _Done
 
-                if paint:
-                    data, dropped = BUS.take_rx()
-                    if dropped and now - said > 2.0:
-                        said = now
-                        note(f"terminal fell behind; dropped {dropped} bytes",
-                             T.warn)
-                    SCREEN.feed(data)
+                if due and now >= next_paint:
+                    self._paint(now)
+                    due, next_paint = False, now + PAINT_MIN
         except _Done:
             pass
+        finally:
+            # Whatever took us out of the loop, the outstanding RX signal is
+            # this session's to claim -- see _paint().
+            self._paint(time.monotonic())
 
         if reason == LOST:
             note(f"{self.dev.label} disconnected", T.warn)
@@ -1712,13 +1876,15 @@ def _page(body: str, hint: str = "any key to resume",
                     return b""
                 kind, payload = BUS.get(min(TICK, left))
                 if kind == RX:
-                    SCREEN.feed(BUS.take_rx()[0])
-                elif kind == KEY:
+                    continue                    # held; claimed on the timeout
+                _claim_rx()
+                if kind == KEY:
                     return payload
-                elif kind == GONE:
+                if kind == GONE:
                     BUS.post(GONE, payload)     # not this loop's to consume
                     return b""
     finally:
+        _claim_rx()                             # however we left, see above
         _flush(SCREEN.release())
 
 
