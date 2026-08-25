@@ -80,6 +80,54 @@ expect("ctrl-t still responsive", r"239a:80f4:TESTBOARD1")
 os.write(master, b"\r")            # the config page is modal; close it
 expect("config page closes", r"\x1b\[\?1049l")
 
+# A device that will not shut up, against a terminal that cannot keep up.
+# This is the shape that locked porter solid on Windows: one bus event per
+# read became one console write per read, the writes backed up, and the
+# keyboard went with them because painting is on the main thread.
+print("a chatty device against a slow terminal")
+blaster = subprocess.Popen(
+    [sys.executable, "-c",
+     "import os\n"
+     "fd = os.open('/tmp/porter_b', os.O_RDWR | os.O_NOCTTY)\n"
+     "b = b'noise ' * 200\n"
+     "while True:\n"
+     "    try: os.write(fd, b)\n"
+     "    except OSError: break\n"],
+    stderr=subprocess.DEVNULL)
+
+# Read slowly, so porter's stdout genuinely backs up.
+end = time.monotonic() + 5.0
+while time.monotonic() < end:
+    try: buf.extend(os.read(master, 2048))
+    except BlockingIOError: pass
+    except OSError: break
+    time.sleep(0.10)
+
+mark = len(buf)
+t0 = time.monotonic()
+os.write(master, b"\x14c")                  # ask for the config page
+answered = None
+while time.monotonic() - t0 < 15.0:
+    try:
+        d = os.read(master, 1 << 20)          # now drain at full speed
+        if d: buf.extend(d)
+    except BlockingIOError: pass
+    except OSError: break
+    if b"\x1b[?1049h" in bytes(buf[mark:]):
+        answered = time.monotonic() - t0
+        break
+    time.sleep(0.002)
+blaster.kill(); blaster.wait()
+record("keyboard survives a flood", answered is not None and answered < 5.0,
+       f"{answered:.2f}s" if answered else "never answered")
+# Falling behind is allowed; doing it silently is not.
+record("dropped output is admitted to",
+       b"fell behind; dropped" in bytes(buf[mark-200000 if mark > 200000 else 0:]))
+CUR[0] = len(buf)
+os.write(master, b"\r")                      # close the page
+expect("page closes after the flood", r"\x1b\[\?1049l")
+pump(0.5)
+
 # hard failure: yank the pty out from under the reader
 print("socat killed mid-session")
 socats[0].kill(); socats[0].wait()

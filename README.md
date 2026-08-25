@@ -301,6 +301,14 @@ Two properties fall out of that shape, and both are the point:
   killed answers instantly instead of waiting — so a wait that could not wait
   sleeps a fixed floor before trying again, and re-arms the console on its way.
 
+Device output is the exception to "everything is an event": it never goes on
+the queue. A chatty port returns from `read()` thousands of times a second, so
+the bytes are merged into one bounded buffer and only a *signal* is queued.
+The loop does one terminal write per pass rather than one per read, and answers
+keystrokes before painting — so `ctrl-t q` still works when a device has gone
+berserk. If the device outruns the terminal for long enough the oldest bytes
+are dropped, and porter says so on the line rather than leaving a silent gap.
+
 The device list is the one thing on a timer rather than an OS notification. That
 is deliberate: `WM_DEVICECHANGE` and netlink only say that *something* changed, so
 finding out what still costs a full `comports()` walk. Native notification would

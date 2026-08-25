@@ -140,14 +140,49 @@ deadlock-freedom is structural, not the result of having checked:
 - **Only the main loop waits on the queue**, and nothing holds it while
   waiting. The wait-for graph is a star with every edge pointing at the queue,
   so no cycle is expressible.
-- **No locks.** The main thread is the only writer to the terminal -- a reader
-  posts `RX` and the loop paints it -- which is what retired `_OUT_LOCK`,
-  `Session._paused` and the reader's share of the SGR filter's state. Adding a
-  lock back is a sign something is being done on the wrong thread.
+- **No lock is ever held across a wait.** The main thread is the only writer
+  to the terminal -- a reader posts and the loop paints -- which is what
+  retired `_OUT_LOCK`, `Session._paused` and the reader's share of the SGR
+  filter's state. The one lock left is `Bus._lock`, held only for a bytearray
+  splice and never across `put()` or a write, so it cannot join the wait
+  graph. A lock held while waiting is how the star grows a cycle.
 
 `KEY` carries raw bytes, not tokens, because the session is a transparent pipe:
 an arrow key has to reach the far-side REPL as the three bytes it arrived as.
 Only the picker wants tokens, and it asks `keys()` for them.
+
+### Device output never goes on the queue
+
+`post_rx()` merges device bytes into one bounded buffer and queues only a
+*signal*, at most one outstanding. This is not an optimisation; the version
+that queued a chunk per read locked porter solid on Windows.
+
+A chatty port returns from `read()` thousands of times a second. One queue
+entry per read became one `write()`+`flush()` per read, ~3000 `WriteConsole`
+round-trips a second saturated conhost until its writes blocked outright, and
+because painting is on the main thread the keyboard went with it. Two rules
+came out of that, and both must hold:
+
+1. **One paint per pass, not one per read.** `take_rx()` returns everything
+   that arrived, so the loop does a single write for a whole burst.
+2. **Control events are answered before the paint.** A keystroke must never
+   wait out a backlog -- that is the difference between `ctrl-t q` working and
+   porter looking wedged. It costs strict ordering between porter's own lines
+   and the device's, which is the right trade: the reorder window is one
+   iteration and only opens when the device is already outrunning the
+   terminal.
+
+`RX_MAX` bounds what has arrived but is not yet painted, because a device can
+outrun any terminal indefinitely and the queue is unbounded by design. Past it
+the oldest bytes go -- and the count is kept and reported by `note()`, because
+a gap in the log that says why it is there is worth far more than a silent
+one. Covered by "a chatty device against a slow terminal" in `t_stress.py`,
+which fails loudly against the version that queued per read.
+
+Painting is still on the main thread, so a terminal that stops accepting
+output entirely -- a Windows console with a selection active, for instance --
+still blocks porter, quit included. If that turns out to matter, the fix is a
+painter thread owning stdout, not a lock around `w_bytes`.
 
 ### A failed wait must still cost time
 

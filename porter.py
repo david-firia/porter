@@ -296,9 +296,46 @@ class Bus:
 
     def __init__(self) -> None:
         self._q: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._rx = bytearray()
+        self._rx_pending = False
+        self._dropped = 0
 
     def post(self, kind: str, payload=None) -> None:
         self._q.put((kind, payload))
+
+    def post_rx(self, data: bytes) -> None:
+        """Device output, coalesced into one buffer and bounded.
+
+        Device bytes do not go on the queue.  A chatty port returns from
+        read() thousands of times a second, and one queue entry per read
+        became one terminal write per read -- which is what saturated a
+        Windows console until its writes blocked outright.  Here the bytes
+        merge and only the *signal* is queued, at most one outstanding, so the
+        loop does one write for however much arrived.
+
+        Bounded, because a device can outrun any terminal indefinitely: past
+        RX_MAX the oldest bytes go and the count is kept, so the gap can be
+        reported rather than silently opening in the log.
+        """
+        with self._lock:
+            self._rx.extend(data)
+            over = len(self._rx) - RX_MAX
+            if over > 0:
+                del self._rx[:over]
+                self._dropped += over
+            first, self._rx_pending = not self._rx_pending, True
+        if first:
+            self._q.put((RX, None))
+
+    def take_rx(self):
+        """Everything the device has said since the last call, and how many
+        bytes had to be dropped to keep that bounded."""
+        with self._lock:
+            data, self._rx = bytes(self._rx), bytearray()
+            dropped, self._dropped = self._dropped, 0
+            self._rx_pending = False
+        return data, dropped
 
     def get(self, timeout: float):
         """The next event, or (None, None) if none arrived in time."""
@@ -307,10 +344,24 @@ class Bus:
         except queue.Empty:
             return None, None
 
+    def drain(self, first):
+        """`first`, plus every event already queued behind it.
+
+        Lets a loop answer a burst in one pass instead of one iteration each,
+        which is what keeps a keystroke from waiting out a backlog.
+        """
+        batch = [first]
+        while True:
+            try:
+                batch.append(self._q.get_nowait())
+            except queue.Empty:
+                return batch
+
+
+BACKLOG_MAX = 256 * 1024    # held while porter owns the screen
+RX_MAX = 128 * 1024         # arrived but not yet painted
 
 BUS = Bus()
-
-BACKLOG_MAX = 256 * 1024
 
 
 class Screen:
@@ -1160,7 +1211,7 @@ def _text_prompt(draw, label: str, initial: str = "") -> str | None:
         _beat()
         kind, payload = BUS.get(POLL)
         if kind == RX:
-            SCREEN.feed(payload)            # the picker owns the screen
+            SCREEN.feed(BUS.take_rx()[0])   # the picker owns the screen
             continue
         if kind != KEY:
             continue
@@ -1264,7 +1315,7 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
         kind, payload = BUS.get(POLL)
 
         if kind == RX:
-            SCREEN.feed(payload)        # held: the picker owns the screen
+            SCREEN.feed(BUS.take_rx()[0])   # held: the picker owns the screen
             continue
 
         if kind == GONE:
@@ -1508,7 +1559,7 @@ class Session:
                     self.bus.post(GONE, self.dev.key)
                     return
                 if data:
-                    self.bus.post(RX, data)
+                    self.bus.post_rx(data)
                     continue
                 # An empty read must still cost its timeout.  A handle whose
                 # device has gone can return empty the instant it is called,
@@ -1526,6 +1577,38 @@ class Session:
             with contextlib.suppress(Exception):
                 self.ser.close()
 
+    def _typed(self, data: bytes):
+        """Hand one chunk of keyboard bytes to the device and to the command
+        state machine.  Returns a session reason, or None to carry on."""
+        # The ack comes down before the keystroke is echoed or forwarded --
+        # otherwise the erase takes back the echo instead of the ack.
+        _TOAST.clear()
+        outgoing = bytearray()
+        reason = None
+        for b in data:
+            if self._armed:
+                self._armed = False
+                cmd = _command(b, self, outgoing)
+                if cmd == "echo":
+                    self.echo = not self.echo
+                    toast(f"local echo {'on' if self.echo else 'off'}")
+                elif cmd:
+                    reason = cmd
+                    break
+            elif b == PREFIX:
+                self._armed = True
+            else:
+                outgoing.append(b)
+
+        if outgoing:
+            try:
+                self.ser.write(bytes(outgoing))
+            except Exception:
+                return LOST
+            if self.echo:
+                SCREEN.feed(bytes(outgoing))
+        return reason
+
     def run(self) -> str:
         """Wait on the bus until something takes us out of the session."""
         if self.lost:
@@ -1534,9 +1617,10 @@ class Session:
 
         reason = QUIT
         absent_since = None
+        said = 0.0              # last time we admitted to dropping output
         try:
             while True:
-                kind, payload = BUS.get(TICK)
+                first = BUS.get(TICK)
                 now = time.monotonic()
                 _beat()
                 _TOAST.tick(now)
@@ -1546,56 +1630,48 @@ class Session:
                 # output would otherwise never come up for judgement.
                 if absent_since is not None and now - absent_since >= GRACE:
                     reason = LOST
-                    break
+                    raise _Done
 
-                if kind == RX:
-                    SCREEN.feed(payload)
-                    continue
-                if kind == GONE:
-                    self.lost = True
-                    reason = LOST
-                    break
-                if kind == PORTS:
-                    # Backstop for a device that stops answering without ever
-                    # faulting: Linux can return empty reads for ever.  The
-                    # snapshot is edge-triggered, so absence is news -- but
-                    # give it a moment, because a driver reshuffling can drop
-                    # a device from one enumeration and put it back.
-                    present = any(_identity(p) == self.dev.key for p in payload)
-                    absent_since = None if present else (absent_since or now)
-                    continue
-                if kind is None:
-                    continue
-
-                # A key chunk.  Bytes, so an arrow reaches the far side whole.
-                # The ack has to come down before the keystroke is echoed, or
-                # the erase would take back the echo instead.
-                _TOAST.clear()
-                outgoing = bytearray()
-                for b in payload:
-                    if self._armed:
-                        self._armed = False
-                        cmd = _command(b, self, outgoing)
-                        if cmd == "echo":
-                            self.echo = not self.echo
-                            toast(f"local echo "
-                                  f"{'on' if self.echo else 'off'}")
-                        elif cmd:
-                            reason = cmd
-                            raise _Done
-                    elif b == PREFIX:
-                        self._armed = True
-                    else:
-                        outgoing.append(b)
-
-                if outgoing:
-                    try:
-                        self.ser.write(bytes(outgoing))
-                    except Exception:
+                # Everything queued is answered in one pass, and the control
+                # events go first.  A keystroke must never wait out a paint:
+                # under a flood that is the difference between ctrl-t q
+                # working and porter looking wedged.  It costs strict ordering
+                # between porter's own lines and the device's -- worth it,
+                # because the reorder window is one iteration and only opens
+                # when the device is already outrunning the terminal.
+                paint = False
+                for kind, payload in BUS.drain(first):
+                    if kind is None:
+                        continue
+                    if kind == RX:
+                        paint = True
+                    elif kind == GONE:
+                        self.lost = True
                         reason = LOST
-                        break
-                    if self.echo:
-                        SCREEN.feed(bytes(outgoing))
+                        raise _Done
+                    elif kind == PORTS:
+                        # Backstop for a device that stops answering without
+                        # ever faulting: Linux can return empty reads for
+                        # ever.  The snapshot is edge-triggered, so absence is
+                        # news -- but give it a moment, because a driver
+                        # reshuffling can drop a device from one enumeration
+                        # and put it straight back.
+                        present = any(_identity(p) == self.dev.key
+                                      for p in payload)
+                        absent_since = None if present else (absent_since or now)
+                    elif kind == KEY:
+                        out = self._typed(payload)
+                        if out is not None:
+                            reason = out
+                            raise _Done
+
+                if paint:
+                    data, dropped = BUS.take_rx()
+                    if dropped and now - said > 2.0:
+                        said = now
+                        note(f"terminal fell behind; dropped {dropped} bytes",
+                             T.warn)
+                    SCREEN.feed(data)
         except _Done:
             pass
 
@@ -1636,7 +1712,7 @@ def _page(body: str, hint: str = "any key to resume",
                     return b""
                 kind, payload = BUS.get(min(TICK, left))
                 if kind == RX:
-                    SCREEN.feed(payload)
+                    SCREEN.feed(BUS.take_rx()[0])
                 elif kind == KEY:
                     return payload
                 elif kind == GONE:
