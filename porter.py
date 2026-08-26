@@ -1344,7 +1344,8 @@ def _render(devs, sel, fresh, msg, cfg_path,
 
 def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
            preselect: str | None, session=None,
-           resumable: bool = False, show_all: bool = False):
+           resumable: bool = False, show_all: bool = False,
+           awaiting: str | None = None):
     """Live device list, driven by events.
 
     Nothing in here polls.  The loop waits on the bus, and devices appear and
@@ -1357,6 +1358,13 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
     looking wedged with no way out but a keystroke.  The picker is already a
     live device monitor; putting the wait anywhere else re-creates that dead
     end.
+
+    `awaiting` is the device key of a session that was lost, and is the one
+    thing porter reconnects to on its own: if that exact device *appears*
+    while this picker is up, we return it rather than wait to be told.  It is
+    the appearance edge, not presence -- a device already in the list when the
+    picker opens is not it, so a failed open lands back here and waits instead
+    of retrying in a loop.
 
     Returns a Device to connect to, CANCEL to go back to the live session, or
     None to quit.
@@ -1404,6 +1412,7 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 # clearing `resumable` would silently turn esc into quit.
                 if session is not None and payload is session:
                     session.lost = True
+                    awaiting = session.dev.key
                 continue
 
             if kind == PORTS:
@@ -1412,6 +1421,10 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 if new_keys == known:
                     continue
                 appeared = new_keys - known
+                if awaiting in appeared:
+                    # The device this picker's session lost, plugged back in:
+                    # take it, rather than make the replug need a keystroke.
+                    return next(d for d in new_devs if d.key == awaiting)
                 fresh |= appeared
                 fresh &= new_keys
                 anchor = devs[sel].key if devs and sel < len(devs) else None
@@ -2022,6 +2035,7 @@ def main(argv=None) -> int:
     last_key = None
     next_dev = None
     current = None          # the live Session, or None
+    awaiting = None         # key of a lost device, to retake if it comes back
 
     with RawTerm():
         reader = KeyReader(BUS)
@@ -2042,7 +2056,7 @@ def main(argv=None) -> int:
                                 current,
                                 resumable=(current is not None
                                            and not current.lost),
-                                show_all=args.all)
+                                show_all=args.all, awaiting=awaiting)
                     finally:
                         WATCHER.attention(False)
 
@@ -2065,6 +2079,7 @@ def main(argv=None) -> int:
                         note(f"cannot open {dev.port}: {err}", T.err)
                         continue
                     current, last_key = fresh, dev.key
+                    awaiting = None     # this is the connection now
 
                 reason = current.run()
 
@@ -2081,6 +2096,9 @@ def main(argv=None) -> int:
                 elif reason == LOST:
                     # Always back to the picker: whatever else is plugged in
                     # stays visible, so losing one device is never a dead end.
+                    # The picker takes this device back if it reappears there;
+                    # anything else still has to be chosen.
+                    awaiting = current.dev.key
                     current.close()
                     current = None
         finally:

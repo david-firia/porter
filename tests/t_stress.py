@@ -60,11 +60,9 @@ for i in range(1, N+1):
     if not expect(f"  disconnect {i}", r"CircuitPython disconnected"): break
     time.sleep(0.4)
     FLAG.write_text("")
-    # Nothing reconnects on its own.  Losing the device landed in the picker,
-    # and a device that appears there is selected for you -- so replug then
-    # enter is the whole reconnect, and this exercises that path per cycle.
-    if not expect(f"  reappears {i}", r"\+new"): break
-    os.write(master, b"\r")
+    # Losing the device landed in the picker, and the device it lost is the
+    # one thing porter takes back on its own -- so the replug above is the
+    # whole reconnect, and this exercises that path once per cycle.
     if not expect(f"  reconnect {i}", r"CircuitPython on /tmp/porter_a @ 115200"): break
     time.sleep(0.3)
 

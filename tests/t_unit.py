@@ -629,6 +629,51 @@ check(f"the picker waits rather than spins ({rate:.0f}/s)",
       rate < porter.SPIN, True)
 
 
+print("the picker takes back the device whose session was lost")
+
+# The one thing porter reconnects to on its own, and only here: same device,
+# same visit to the picker, and only on the edge where it *appears*.
+_A = P("/dev/a", 0x239a, 0x80f4, "AAA", description="board A")
+_B = P("/dev/b", 0x0403, 0x6001, "BBB", description="board B")
+
+class _Plug:
+    """Bus stand-in: the first get() plugs one port in, the next ends the loop."""
+    def __init__(self, ports, arriving):
+        self.ports, self.arriving, self.gets = ports, arriving, 0
+    def get(self, timeout=None):
+        self.gets += 1
+        if self.gets > 1:
+            _stop()
+        self.ports.append(self.arriving)
+        return porter.PORTS, list(self.ports)
+    def take_rx(self):
+        return b"", 0
+
+def _on_plug(present, arriving, awaiting):
+    """What the picker does when `arriving` turns up while it is on screen."""
+    ports = list(present)
+    with mock(porter, "_scan_ports", lambda: list(ports)),          mock(porter, "BUS", _Plug(ports, arriving)),          mock(porter, "w", _noop), mock(porter, "w_bytes", _noop):
+        try:
+            return porter.picker(configparser.ConfigParser(),
+                                 pathlib.Path("nowhere"), {}, None, None,
+                                 awaiting=awaiting)
+        except _Stop:
+            return None
+
+got = _on_plug([], _A, "239a:80f4:AAA")
+check("the awaited device is returned the moment it appears",
+      got and got.port, "/dev/a")
+check("a different device is not",
+      _on_plug([], _B, "239a:80f4:AAA"), None)
+check("and with nothing awaited, nothing is taken",
+      _on_plug([], _A, None), None)
+# Presence is not enough: a device already listed when the picker opened was
+# not plugged in during this visit, so a failed open lands back here and
+# waits rather than retrying in a loop.
+check("a device already in the list is not an arrival",
+      _on_plug([_A], _B, "239a:80f4:AAA"), None)
+
+
 print("the screen holds device output while porter owns it")
 
 written = []

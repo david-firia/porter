@@ -145,18 +145,12 @@ ok = b"\x1b[?1049h" in since(n)
 print(("  ok  " if ok else "  FAIL ")+"loss lands in the picker")
 expect("the other device is still listed", r"FTDI second", timeout=5)
 
-# Auto-reconnect is deliberately not a feature: coming back must be the
-# user's decision, so a device that returns is tagged and waits to be picked.
+# The one thing porter reconnects to on its own: the device whose session it
+# just lost, appearing again during this same visit to the picker.  Plug it
+# back in and you are on it, with no keystroke at all.
 FLAG.write_text("")
-expect("the device comes back tagged", r"\+new", timeout=8)
-n = mark(); pump(2.5)
-ok = b"CircuitPython on /tmp/porter_a" not in since(n)
-(oks if ok else fails).append("nothing reconnects on its own")
-print(("  ok  " if ok else "  FAIL ")+"nothing reconnects on its own")
-
-# A device that appears is selected for you, so replug-then-enter connects.
-send("\r")
-expect("reconnected by hand", r"CircuitPython on /tmp/porter_a @ 115200", timeout=8)
+expect("the lost device is taken back on sight",
+       r"CircuitPython on /tmp/porter_a @ 115200", timeout=8)
 pump(0.8)
 
 print("a second device stays reachable while one is missing")
@@ -167,6 +161,9 @@ expect("back to the picker", r"enter connect", timeout=8)
 FLAG_B.unlink(); pump(1.5)
 FLAG_B.write_text("")
 expect("second device appears while waiting", r"FTDI second", timeout=8)
+# ... and is not connected to: only the lost device comes back by itself.
+absent("a different device still waits to be picked",
+       r"FTDI second on /tmp/porter_c")
 send("\r"); expect("and can be connected to", r"FTDI second on /tmp/porter_c", timeout=8)
 FLAG.write_text(""); pump(1.5)
 send(b"\x14d"); pump(0.8)

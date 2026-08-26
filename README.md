@@ -174,8 +174,11 @@ recognised across replugs even when Windows renumbers it.
   meanwhile is buffered and flushed when you return. With no session behind it, `esc`
   exits. `q` always exits.
 - **Losing a device always lands here**, with everything else still plugged in
-  visible and selectable. Nothing reconnects on its own: a board that comes back
-  is tagged `+new` and selected, so replug-then-enter is the whole reconnect.
+  visible and selectable — and **the board you just lost is taken back on sight**:
+  plug it in again while the picker is up and porter reconnects to it with no
+  keystroke at all. That is the only thing that connects itself, and only on the
+  replug: any *other* device that turns up is tagged `+new` and selected, so
+  replug-then-enter is the whole reconnect.
 - `h` cycles the high-contrast themes, same key as in a session.
 - Ports with no USB vid:pid (motherboard COM1/COM2, Bluetooth SPP, virtual sniffer
   bridges) are hidden. `--all` or `show_all = true` reveals them, and any port you have

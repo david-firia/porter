@@ -307,7 +307,7 @@ things follow from where that lives:
   pegged core as a failed wait that returns instantly -- see above; it is the
   same rule, and catching rather than crashing does not exempt you from it.
 
-## Losing a device lands in the picker, and nothing reconnects by itself
+## Losing a device lands in the picker, and only that device comes back
 
 **Losing a device always lands in the picker.** This is the important property,
 and it is not just cosmetic. An earlier version waited in place watching only
@@ -317,17 +317,41 @@ picker is already a live device monitor; putting the wait anywhere else
 re-creates that dead end. Covered by "a second device stays reachable while one
 is missing" in `t_integ.py`.
 
-Auto-reconnect was removed deliberately and is **deferred, not forgotten**. It
-had earned a `SETTLE` window, a `FLAP_FLOOR`, a re-arm that had to survive a
-failed open, and a rule about matching the appearance edge rather than presence
--- four pieces of state on the one loop porter can drive with no human in it.
-Do not reintroduce it until the event-driven core has had real running time.
+**The device that was lost is the one thing porter reconnects to on its own.**
+`picker(awaiting=...)` takes the key of the device whose session ended, and
+returns that device the moment it *appears* -- so unplug, replug, and you are
+back on it with no keystroke. Everything else that turns up is tagged `+new`
+and the selection jumps to it, and still has to be chosen.
 
-What replaces it costs nothing: a device that appears in the picker is tagged
-`+new` and the selection jumps to it, so replug-then-enter is the whole
-reconnect. `Session.lost` is the only remnant -- it lets a session that died
-while the picker was up report the disconnect rather than resume, so `esc`
-still means "never mind" and never silently becomes quit.
+That this is one variable and one condition is the whole point. The standalone
+auto-reconnect that was removed drove the connection from *outside* the picker
+and had earned a `SETTLE` window, a `FLAP_FLOOR`, a re-arm that had to survive
+a failed open, and a rule about matching the appearance edge rather than
+presence -- four pieces of state on the one loop porter can drive with no human
+in it. **Do not bring that back.** The picker is already watching the port set,
+so what lives there instead needs none of it:
+
+- **The appearance edge, not presence**, and only within one visit to the
+  picker: a device already in the list when the picker opened is not an
+  arrival. That is what keeps a failed open from becoming a retry loop -- the
+  picker reopens with the device present, nothing appears, and it waits to be
+  picked like anything else. It is also why there is no `SETTLE` and no
+  `FLAP_FLOOR`: the watcher's diff is already the debounce.
+- **Only the device that was lost.** `awaiting` is set when a session ends in
+  `LOST`, and in the picker itself when `GONE` arrives for the session behind
+  it -- the unplug-while-the-picker-is-up case, which never reaches `main`
+  until `esc` is pressed. It is cleared the instant any session opens, so
+  connecting to something else ends the wait.
+- **Only in the picker.** Nothing watches for a lost device from a live
+  session, because there is no live session to watch from.
+
+`Session.lost` is the other remnant -- it lets a session that died while the
+picker was up report the disconnect rather than resume, so `esc` still means
+"never mind" and never silently becomes quit.
+
+Covered by "the picker takes back the device whose session was lost" in
+`t_unit.py` (including the three cases that must *not* fire) and by the
+unplug/replug cycles in `t_stress.py`.
 
 ### `GONE` names the session, not the device
 
