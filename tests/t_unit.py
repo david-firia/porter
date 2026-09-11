@@ -351,6 +351,34 @@ def flaky():
 
 check("a failed enumeration reports nothing at all", flaky(), [["/dev/ttyA"]])
 
+# Windows enumerates a USB-serial device as soon as the class driver claims
+# it, but the COM number is a registry value the driver writes a moment
+# later -- and pyserial reads that value without checking whether the read
+# worked, so a device caught mid-attach comes back fully described with
+# device=''.  Its identity is the *same* as the real entry about to appear,
+# so left in the list it is an arrival for the very device porter is waiting
+# for: porter opens port '', fails, and then never sees the real name land
+# because the key never changed.  That is the "could not open port ''" loop.
+print("a port with no name is not a port")
+
+PHANTOM = P("", 0x239a, 0x80f4, "AAA", description="USB Serial Device")
+REAL = P("COM7", 0x239a, 0x80f4, "AAA", description="USB Serial Device (COM7)")
+
+check("the nameless entry and the real one are one device",
+      porter._identity(PHANTOM), porter._identity(REAL))
+check("a nameless port is dropped",
+      [p.device for p in porter._named([PHANTOM, REAL])], ["COM7"])
+check("a blank one too", porter._named([P("  ", 0x1, 0x2, "BB")]), [])
+check("the watcher never publishes one, so the real name is still an arrival",
+      posted([PHANTOM], [PHANTOM, REAL]), [[], ["COM7"]])
+
+# _identity() is deliberately port-independent, so the same board on a
+# different COM number is the same key -- and a diff on keys alone leaves the
+# picker showing a port that no longer exists, with no event to correct it.
+check("a port renamed under a stable key still posts",
+      posted([REAL], [P("COM9", 0x239a, 0x80f4, "AAA")]),
+      [["COM7"], ["COM9"]])
+
 print("the bus")
 
 bus = porter.Bus()
@@ -489,6 +517,60 @@ check("and still carries the underlying error", "Access is denied" in err, True)
 alive.set(); stuck.join(timeout=2.0)
 check("a leak that lets go is forgotten", porter._holder("COM77"), None)
 check("... and stops being reported", porter._LEAKED.get("COM77"), None)
+
+
+# The retry between open attempts is the one stretch with no session and no
+# picker behind it.  A sleep there is felt as a lockup: keys pressed during
+# it are not lost, they queue and land afterwards in the picker, where enter
+# starts the open again.
+print("the wait between open attempts is on the bus")
+
+class _Events:
+    """Bus stand-in that hands out queued events, then nothing."""
+    def __init__(self, *events): self.events, self.gets = list(events), 0
+    def get(self, timeout):
+        self.gets += 1
+        return self.events.pop(0) if self.events else (None, None)
+
+with mock(porter, "BUS", _Events((porter.KEY, b"\x1b"))):
+    check("esc gives up on a retrying open", porter._wait_bus(9.0), True)
+with mock(porter, "BUS", _Events((porter.KEY, b"\x03"))):
+    check("so does ctrl-c", porter._wait_bus(9.0), True)
+
+started = time.monotonic()
+with mock(porter, "BUS", _Events((porter.KEY, b"x"), (porter.KEY, b"\r"))):
+    check("any other key is dropped, not queued", porter._wait_bus(0.05), False)
+check("... and the wait still costs its time, or a caller is a spin",
+      time.monotonic() - started >= 0.05, True)
+
+# A reader leaked from an earlier session may still be posting.  Claiming the
+# signal here would re-arm it every pass and free-run this loop at the
+# reader's rate -- the same rule as the loops that own the screen.
+bus = porter.Bus()
+bus.post_rx(b"boot log")
+with mock(porter, "BUS", bus):
+    porter._wait_bus(0.02)
+check("device output is left outstanding, not claimed", bus.take_rx(),
+      (b"boot log", 0))
+
+class _Shut:
+    """serial.Serial stand-in whose port never opens."""
+    def open(self): raise OSError("could not open port")
+
+gone = porter.Device(port="COM5", key="239a:80f4:AAA", label="board", baud=115200)
+said = []
+with mock(porter, "serial", types.SimpleNamespace(Serial=_Shut)), \
+     mock(porter, "_wait_bus", lambda _s: True), mock(porter, "note", said.append):
+    ser, err = porter._open_port(gone)
+check("a cancelled wait ends the retries", (ser, err is porter.CANCELLED),
+      (None, True))
+check("... after one attempt, not ten", len(said), 1)
+
+sess = porter.Session(gone, porter.Bus())
+with mock(porter, "_open_port", lambda d: (None, porter.CANCELLED)), \
+     mock(porter, "note", _noop):
+    check("and giving up is not reported as a failure", sess.open(),
+          "gave up opening COM5")
 
 
 print("a session dies only on its own reader's fault")

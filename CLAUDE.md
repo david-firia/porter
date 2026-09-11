@@ -264,6 +264,60 @@ snapshot. `attention()` scans fast while the picker is on screen and slowly
 behind a live session, where nobody is reading the list and a lost device is
 noticed by its reader faulting long before any scan would.
 
+### A port with no name is not a port, and the diff is on identity *and* name
+
+Two rules, from one bug: porter announcing `could not open port ''` over and
+over, and needing a physical replug to recover.
+
+**`_named()` drops entries whose `device` is empty, at the source.** Windows
+enumerates a USB-serial device the moment the class driver claims it, but the
+COM number is a registry value the driver writes slightly later -- and
+pyserial's Windows backend reads that value without checking whether the read
+succeeded, so a device caught mid-attach comes back *fully described* with
+`device` set to `''`. It is not a port; nothing downstream should ever see it.
+The filter is in `PortWatcher.run` and in `_scan_ports`, and it must stay at
+that boundary rather than at each use, because the damage is not just a failed
+open:
+
+- `_identity()` is port-independent, so the nameless entry carries **the same
+  key as the real entry about to appear**. Left in the list it is an arrival
+  for the very device the picker is waiting for, and porter opens `''`.
+- Worse, that key is now *present*. When the real name lands, the key set has
+  not changed, so on the old key-only diff **nothing was posted at all** -- a
+  list stuck pointing at a port that never existed, where enter just repeats
+  the failure. Unplugging is the only thing that clears it, which is exactly
+  what the user had to do.
+
+**The watcher's diff and the picker's are on `(identity, port)`.** They answer
+different questions and both are needed: "what just arrived?" is identity
+alone -- a board back on a different COM number is the same device, not a new
+one -- but "is what is on screen still true?" has to include the name, or a
+renamed port is invisible. `_listing()` is the picker's half of that.
+
+Covered by "a port with no name is not a port" in `t_unit.py`, whose last two
+checks are the two halves of the bug: the nameless entry must not be
+published, and the real name landing must still post.
+
+### An automatic retry must be interruptible, and must be bounded
+
+`_open_port` retries while the driver settles, and that wait is on the bus
+(`_wait_bus`), not a `sleep`. It has to be: this runs on the main thread with
+no session and no picker behind it, so it is the one stretch of porter that
+has nothing on screen and nothing to paint. A sleep there does not merely
+ignore the keyboard for three seconds -- the keys are not lost, they queue and
+arrive afterwards in the picker, where enter starts the same open again. The
+report was "porter is stuck", and that is what it was. `esc` and `ctrl-c` give
+up; every other key is **discarded**, because with no port open there is
+nowhere for a byte to go and queueing it is what closed that loop.
+
+It leaves the RX signal outstanding (a reader leaked from an earlier session
+may still be posting -- see `_claim_rx()`) and it always costs its time, or a
+caller that loops on it is a spin. Giving up is reported as giving up, not as
+a failure: `Session.open()` owns the whole line it returns, `CANCELLED` and
+all, so `main` only has to `note()` it.
+
+Covered by "the wait between open attempts is on the bus" in `t_unit.py`.
+
 ### An empty read must always cost its timeout
 
 `Session._read_loop` sleeps out the remainder of `ser.timeout` whenever a read
@@ -337,6 +391,14 @@ so what lives there instead needs none of it:
   picker reopens with the device present, nothing appears, and it waits to be
   picked like anything else. It is also why there is no `SETTLE` and no
   `FLAP_FLOOR`: the watcher's diff is already the debounce.
+- **One attempt, then it is the user's turn.** `awaiting` is cleared when the
+  open it caused fails, so a device that *flaps* in the enumeration cannot
+  turn the appearance edge into a retry loop -- every flap is another arrival,
+  and an arrival porter connects to by itself is a loop with nobody driving
+  it. The watcher's diff debounces a real device, not an artifact of
+  enumeration (see `_named()`), which is why presence-vs-edge is not enough on
+  its own. Still one variable and no timers, and the device is one keystroke
+  away in the picker porter lands in.
 - **Only the device that was lost.** `awaiting` is set when a session ends in
   `LOST`, and in the picker itself when `GONE` arrives for the session behind
   it -- the unplug-while-the-picker-is-up case, which never reaches `main`

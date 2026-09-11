@@ -178,7 +178,13 @@ recognised across replugs even when Windows renumbers it.
   plug it in again while the picker is up and porter reconnects to it with no
   keystroke at all. That is the only thing that connects itself, and only on the
   replug: any *other* device that turns up is tagged `+new` and selected, so
-  replug-then-enter is the whole reconnect.
+  replug-then-enter is the whole reconnect. It is *one* attempt: if that open
+  fails, the device is still listed and one enter away, but porter waits to be
+  told rather than retrying by itself.
+- **An open that has to retry can be given up on with `esc`.** A USB-serial device
+  is often enumerated a moment before its driver will hand over the port, so porter
+  retries while it settles rather than failing an open you would only press enter
+  at again. That wait answers the keyboard like everything else does.
 - `h` cycles the high-contrast themes, same key as in a session.
 - Ports with no USB vid:pid (motherboard COM1/COM2, Bluetooth SPP, virtual sniffer
   bridges) are hidden. `--all` or `show_all = true` reveals them, and any port you have

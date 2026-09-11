@@ -1100,11 +1100,18 @@ class PortWatcher(threading.Thread):
 
             try:
                 if ports is not None:
+                    ports = _named(ports)
                     self._ports = ports
                     self.ready.set()
-                    now_keys = {_identity(p) for p in ports}
-                    if now_keys != seen:
-                        seen = now_keys
+                    # Identity *and* name.  A device whose port name changes
+                    # under a stable key is a change the picker has to see:
+                    # `_identity()` is deliberately port-independent, so a
+                    # board that comes back on a different COM number is the
+                    # same key, and a diff on keys alone leaves the picker
+                    # holding a port that no longer exists.
+                    now = {(_identity(p), p.device) for p in ports}
+                    if now != seen:
+                        seen = now
                         self.bus.post(PORTS, ports)
             except Exception as exc:
                 # The scan is guarded above; the diff was not.  _identity()
@@ -1124,10 +1131,31 @@ class PortWatcher(threading.Thread):
             self._quit.wait(max(self.interval, self.last_scan * self.SHARE))
 
 
+def _named(ports: list) -> list:
+    """The ports that have a name, which is the only kind that can be opened.
+
+    Windows enumerates a USB-serial device as soon as the class driver claims
+    it, but the COM number itself is a registry value the driver writes a
+    moment later -- and pyserial reads that value without checking whether
+    the read succeeded, so a device caught mid-attach (or mid-removal, once
+    its key is gone but the devinfo is not) comes back fully described with
+    `device` set to the empty string.
+
+    That artifact has to be dropped here, before anything downstream sees it.
+    It cannot be opened, and because `_identity()` is port-independent it
+    carries the *same* key as the real entry about to appear -- so left in, it
+    is an arrival for the very device porter is waiting for, `_open_port` is
+    handed port='', and the list then never changes again when the real name
+    lands: same key, no diff, a stale port that only a physical replug
+    clears.  That is the "could not open port ''" loop.
+    """
+    return [p for p in ports if (p.device or "").strip()]
+
+
 def _scan_ports() -> list:
     if WATCHER is not None:
         return WATCHER.ports()
-    return list(list_ports.comports())
+    return _named(list_ports.comports())
 
 
 def _identity(p) -> str:
@@ -1268,6 +1296,17 @@ class _Cancel:
 CANCEL = _Cancel()
 
 
+def _listing(devs) -> set:
+    """What the picker has on screen, for deciding whether that is stale.
+
+    Identity *and* port, unlike `known`, which is identities alone.  The two
+    are different questions: a device that comes back on a different port is
+    not an arrival -- same key -- but every row naming its old port is wrong
+    until the list is rebuilt.
+    """
+    return {(d.key, d.port) for d in devs}
+
+
 def _text_prompt(draw, label: str, initial: str = "") -> str | None:
     """Modal one-line input drawn under the device list.  None if cancelled."""
     buf = list(initial)
@@ -1371,6 +1410,7 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
     """
     devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
     known = {d.key for d in devs}
+    shown = _listing(devs)
     fresh: set[str] = set()
     msg = ""
     dirty = True
@@ -1417,9 +1457,15 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
 
             if kind == PORTS:
                 new_devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
-                new_keys = {d.key for d in new_devs}
-                if new_keys == known:
+                # Two questions, and they are not the same one.  "Is what is
+                # on screen still true?" is identity and port; "what just
+                # arrived?" is identity alone, because a device that comes
+                # back on a different port is not an arrival.
+                new_shown = _listing(new_devs)
+                if new_shown == shown:
                     continue
+                shown = new_shown
+                new_keys = {d.key for d in new_devs}
                 appeared = new_keys - known
                 if awaiting in appeared:
                     # The device this picker's session lost, plugged back in:
@@ -1520,6 +1566,7 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                     cfg, _ = load_config(cfg_path)
                     devs = enumerate_devices(cfg, overrides, cli_baud, show_all)
                     known = {d.key for d in devs}
+                    shown = _listing(devs)
                     sel = max(0, min(sel, len(devs) - 1)) if devs else 0
                     msg = "reloaded"
                     dirty = True
@@ -1569,6 +1616,45 @@ def _holder(port: str):
     return thread
 
 
+class _Cancelled:
+    """Sentinel: the user gave up on an open that was still retrying."""
+
+
+CANCELLED = _Cancelled()
+
+
+def _wait_bus(secs: float) -> bool:
+    """Spend `secs` on the bus, and say whether the user asked to stop.
+
+    For the main thread while it is opening a port: there is no session and
+    no picker behind it, so this is the one stretch of porter that has
+    nothing on screen and nothing to paint.  A plain sleep here is the only
+    place left where porter reacts to nothing at all -- and it is felt as a
+    lockup, because the keys pressed during it are not lost, they queue and
+    arrive afterwards in the picker, where enter starts the open again.
+
+    So it waits where everything else waits.  esc and ctrl-c give up; every
+    other key is *discarded*, because with no port open there is nowhere for
+    a byte to go and queueing it is what closes that loop.
+
+    Device output is left outstanding rather than claimed: a reader leaked
+    from an earlier session may still be posting, and claiming the signal
+    here would re-arm it every pass and free-run this loop at the reader's
+    rate -- the same rule as `_claim_rx()`, for the same reason.  And the
+    wait must consume its time whatever arrives, or a caller that loops on it
+    is a spin.
+    """
+    deadline = time.monotonic() + secs
+    while True:
+        _beat()
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        kind, payload = BUS.get(min(left, TICK))
+        if kind == KEY and {"ESC", "CTRL-C"} & set(keys(payload)):
+            return True
+
+
 def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
     """Open the port, retrying while the driver settles.
 
@@ -1576,6 +1662,10 @@ def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
     attaching, so selecting a device the moment it shows up in the picker
     routinely beats the driver to the port.  Retry rather than reporting a
     failure the user can only fix by pressing enter again.
+
+    The wait between attempts is on the bus -- see `_wait_bus()`.  Every
+    retry porter does automatically has to be interruptible, or the retrying
+    is indistinguishable from being stuck.
     """
     last = None
     for attempt in range(1, attempts + 1):
@@ -1594,11 +1684,11 @@ def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
         except Exception as exc:
             last = exc
             if attempt == 1:
-                note(f"opening {dev.port} ...")
+                note(f"opening {dev.port} ... (esc to give up)")
             elif attempt % 3 == 0:
                 note(f"still opening {dev.port} ({attempt}/{attempts}): {exc}")
-            _beat()
-            time.sleep(delay)
+            if _wait_bus(delay):
+                return None, CANCELLED
             # Give up early if the device left again.
             if not any(_identity(pt) == dev.key for pt in _scan_ports()):
                 break
@@ -1630,13 +1720,16 @@ class Session:
         self._stop = threading.Event()
 
     def open(self) -> str | None:
-        """Connect.  Returns None on success, or an error to report."""
+        """Connect.  Returns None on success, or the line to report."""
         ser, err = _open_port(self.dev)
         if ser is None:
+            if err is CANCELLED:
+                return f"gave up opening {self.dev.port}"
             if _holder(self.dev.port) is not None:
-                return (f"{err} - still held by this porter's own reader, "
-                        "which did not stop when the device went")
-            return str(err)
+                return (f"cannot open {self.dev.port}: {err} - still held by "
+                        "this porter's own reader, which did not stop when "
+                        "the device went")
+            return f"cannot open {self.dev.port}: {err}"
         self.ser = ser
         self._thread = threading.Thread(target=self._read_loop, daemon=True,
                                         name="serial-reader")
@@ -2076,7 +2169,17 @@ def main(argv=None) -> int:
                     fresh = Session(dev, BUS)
                     err = fresh.open()
                     if err:
-                        note(f"cannot open {dev.port}: {err}", T.err)
+                        note(err, T.err)
+                        # One automatic attempt per loss, and no more.  The
+                        # picker's appearance edge is the debounce for a real
+                        # device, but not for one that flaps in the
+                        # enumeration: every flap is another arrival, and an
+                        # arrival porter connects to by itself is an open
+                        # loop with nobody driving it.  Clearing the wait
+                        # here is what bounds it -- one variable, no timers,
+                        # and the device is still one keystroke away in the
+                        # picker we are about to land in.
+                        awaiting = None
                         continue
                     current, last_key = fresh, dev.key
                     awaiting = None     # this is the connection now
