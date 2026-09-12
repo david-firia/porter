@@ -94,7 +94,6 @@ class Theme:
     name: str
     fg: str            # terminal default colours, as OSC 10/11 wants them;
     bg: str            # empty means "leave the user's own scheme alone"
-    base: str          # SGR that re-establishes fg/bg after a reset
     bold: str
     muted: str         # counts, key hints, paths -- present but secondary
     sel: str           # the selected row
@@ -106,8 +105,18 @@ class Theme:
 
     @property
     def reset(self) -> str:
-        """End a styled run without falling back to the terminal's colours."""
-        return SGR0 + self.base
+        """End a styled run, falling back to the terminal's own colours.
+
+        Which is the whole trick, and the reason this is a bare SGR0 for every
+        theme.  A terminal stores the attributes a cell was *written* with, so
+        an explicit colour is permanent: a theme that re-established its own
+        fg/bg here would stamp them into every cell porter emits, and
+        switching themes would leave everything already on screen in the old
+        one -- a half-repainted screen instead of the clean repaint OSC 10/11
+        exists to give.  The screen colours live in the terminal's defaults,
+        in one place, and nowhere else.  Do not add an SGR pair back here.
+        """
+        return SGR0
 
 
 # Both high-contrast themes spend their roles the same way; only the two
@@ -116,19 +125,37 @@ _HC_ROLES = dict(bold=BOLD, muted="", sel=REV, alias=BOLD, ok=BOLD, warn=BOLD,
                  err=REV, strip_sgr=True)
 
 THEMES = {
-    "default": Theme("default", fg="", bg="", base="",
+    "default": Theme("default", fg="", bg="",
                      bold=BOLD, muted=DIM, sel=REV, alias=CYAN, ok=GREEN,
                      warn=YELLOW, err=RED, strip_sgr=False),
     "contrast-dark": Theme("contrast-dark", fg="#ffffff", bg="#000000",
-                           base=CSI + "0;97;40m", **_HC_ROLES),
+                           **_HC_ROLES),
     "contrast-light": Theme("contrast-light", fg="#000000", bg="#ffffff",
-                            base=CSI + "0;30;107m", **_HC_ROLES),
+                            **_HC_ROLES),
 }
 
 # OSC 10/11 set the terminal's *own* default colours, so a switch repaints the
-# scrollback that is already on screen; 110/111 hand them back.
-_OSC_SET = "\x1b]10;{}\x07\x1b]11;{}\x07"
-_OSC_RESET = "\x1b]110\x07\x1b]111\x07"
+# scrollback that is already on screen -- which only holds while nothing porter
+# writes carries a colour of its own.  See Theme.reset.
+#
+# They are not the only colours on that screen, and the two porter does not
+# set are the ones the terminal picks from *its* scheme: the selection
+# highlight (17/19) and the cursor (12).  Leave those and a high-contrast
+# theme paints a white background under a near-white selection highlight
+# chosen for a dark scheme -- a selection you cannot see is a log you cannot
+# copy out of, which is most of what the log is for.  It is symmetrical:
+# contrast-dark does the same thing to anyone whose terminal is light.
+#
+# The selection is the theme inverted -- highlight background from the
+# theme's foreground and vice versa -- which is what reverse video means and
+# what `sel` already does for the picker's own selected row.  The cursor
+# takes the foreground, so it stands against the background by construction.
+#
+# 110/111, 117/119 and 112 hand each pair back.
+_OSC_SET = ("\x1b]10;{fg}\x07\x1b]11;{bg}\x07"
+            "\x1b]17;{fg}\x07\x1b]19;{bg}\x07"
+            "\x1b]12;{fg}\x07")
+_OSC_RESET = "\x1b]110\x07\x1b]111\x07\x1b]117\x07\x1b]119\x07\x1b]112\x07"
 
 T = THEMES["default"]
 
@@ -523,12 +550,12 @@ def note(text: str, style: str | None = None) -> None:
 
 
 def set_theme(name: str) -> None:
-    """Switch palette, and tell the terminal which default colours to paint."""
+    """Switch palette, and tell the terminal which colours to paint with."""
     global T
     had_colours = bool(T.fg)
     T = THEMES[name]
     if T.fg:
-        w(_OSC_SET.format(T.fg, T.bg) + T.reset)
+        w(_OSC_SET.format(fg=T.fg, bg=T.bg) + T.reset)
     elif had_colours:
         w(_OSC_RESET + T.reset)
 

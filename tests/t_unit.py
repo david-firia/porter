@@ -157,10 +157,46 @@ check("cycle wraps back to default", cycle,
       ["contrast-dark", "contrast-light", "default"])
 check("high contrast spends no colour on roles",
       porter.THEMES["contrast-dark"].alias, porter.BOLD)
-check("reset re-establishes the theme's own colours",
-      porter.THEMES["contrast-light"].reset, porter.SGR0 + porter.CSI + "0;30;107m")
-check("default theme leaves the terminal's colours alone",
-      porter.THEMES["default"].reset, porter.SGR0)
+
+# A terminal stores the attributes a cell was written with, so an explicit
+# colour is permanent.  The theme's screen colours therefore live in the
+# terminal's defaults and nowhere else: if porter stamped them into what it
+# writes, switching themes would leave everything already on screen in the old
+# one instead of repainting it.
+check("no theme stamps its screen colours into the text",
+      [t.reset for t in porter.THEMES.values()], [porter.SGR0] * 3)
+hc = porter.THEMES["contrast-dark"]
+check("... and high contrast puts no colour in its roles either",
+      {hc.bold, hc.muted, hc.sel, hc.alias, hc.ok, hc.warn, hc.err}
+      <= {porter.BOLD, porter.REV, ""}, True)
+
+# The selection highlight and the cursor come from the terminal's own scheme,
+# so a theme that repaints the screen and not those leaves a near-white
+# selection on the white background it just painted -- a log that cannot be
+# copied out of.  The selection is the theme inverted; the cursor takes the
+# foreground.
+def themed(name):
+    out = []
+    with mock(porter, "w", out.append):
+        porter.set_theme(name)
+    return "".join(out)
+
+light = themed("contrast-light")
+check("the screen colours are set", ("\x1b]10;#000000\x07" in light,
+      "\x1b]11;#ffffff\x07" in light), (True, True))
+check("the selection is the theme inverted", ("\x1b]17;#000000\x07" in light,
+      "\x1b]19;#ffffff\x07" in light), (True, True))
+check("the cursor takes the foreground", "\x1b]12;#000000\x07" in light, True)
+
+dark = themed("contrast-dark")
+check("and it holds the other way up", ("\x1b]17;#ffffff\x07" in dark,
+      "\x1b]19;#000000\x07" in dark), (True, True))
+
+back = themed("default")
+check("every colour the theme took is handed back", back.startswith(
+      "\x1b]110\x07\x1b]111\x07\x1b]117\x07\x1b]119\x07\x1b]112\x07"), True)
+check("... and the default theme asks for none of its own",
+      "\x1b]17;" in back, False)
 
 print("device colours flattened under a high-contrast theme")
 def strip(*chunks):

@@ -232,7 +232,18 @@ the top. Cursor movement and screen clears still pass through, so a full-screen 
 on the far end keeps working; it just arrives monochrome.
 
 The switch is sent to the terminal as OSC 10/11, so the scrollback already on screen
-repaints as well, and the terminal's own colours are handed back on exit.
+repaints as well — switch mid-session and the log you have been reading changes with
+you, rather than leaving you with half a screen in the old theme. That works because a
+high-contrast theme spends no colour of its own: a terminal keeps the colour a cell was
+written with for ever, so anything porter stamped in would be frozen there. The screen
+colours live in the terminal's defaults and nowhere else, and are handed back on exit.
+
+**The selection highlight and the cursor come along with it** (OSC 17/19 and 12). They
+have to: those colours come from your terminal's scheme, so `contrast-light` under a
+dark scheme would otherwise paint a white background beneath a near-white selection
+highlight, and a selection you cannot see is a log you cannot copy out of. The
+selection is the theme inverted, and the cursor takes the foreground. A terminal that
+does not implement those sequences ignores them and is no worse off than before.
 
 Set `theme = contrast-dark` under `[porter]` to start that way — useful when you
 already know you are heading outside.

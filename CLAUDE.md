@@ -129,6 +129,57 @@ is a one-row DECSTBM scroll region installed only while the toast is up, so
 output keeps flowing above it. Same call sites, different paint function --
 do not reach for it before the delay is actually a problem.
 
+## A theme takes every colour on the screen, or none
+
+### It takes them through the terminal's defaults, never through SGR
+
+`Theme.reset` is a bare `SGR0` for every theme, and must stay one. A terminal
+stores the attributes a cell was *written* with, so an explicit colour is
+permanent -- OSC 10/11 change what "default" means and repaint every cell that
+asked for it, and cannot touch a cell that named its colour outright.
+
+So a theme that re-established its own fg/bg after each reset would stamp them
+into everything porter emits, and switching themes would leave all of it in
+the old theme: half a screen repainted, half not. That is what the `base`
+field did, and why it is gone. The high-contrast roles spend bold and reverse
+video only, for the same reason -- neither carries a colour, so neither
+freezes.
+
+The residue is small and inherent: notes written under `default` keep the
+role colour they were written in, and so does unstripped device output. Those
+are the colours of the moment they happened, not the theme's.
+
+### And it takes the ones the terminal would pick itself
+
+`default` sets nothing and inherits the user's scheme entirely. The
+high-contrast themes take the screen over, and "the screen" is more than the
+two colours it is tempting to set: the terminal also picks the **selection
+highlight** and the **cursor** out of its own scheme, and those do not follow
+OSC 10/11.
+
+Set only the pair and a high-contrast theme paints a white background beneath
+a near-white selection highlight chosen for a dark scheme. The selection
+becomes invisible, which means the log cannot be copied out of -- most of what
+the log is for, and the reason `log_view()` exists at all. It is symmetrical:
+`contrast-dark` does the same thing to anyone whose terminal is light, so
+testing on one scheme proves nothing about the other.
+
+So `_OSC_SET` carries 10/11, **17/19 and 12**, and `_OSC_RESET` hands back
+every one of them (110/111, 117/119, 112). Neither string is complete without
+the other: a colour taken and not handed back outlives porter in the user's
+terminal.
+
+Nothing new is stored to do it. The selection is the theme inverted --
+highlight background from the theme's foreground and vice versa, which is what
+reverse video means and what `sel` already does for the picker's own selected
+row -- and the cursor takes the foreground, so it stands against the
+background by construction. A theme that needed its own selection colours
+would be a theme whose `fg`/`bg` were not a contrasting pair.
+
+Verified against Windows Terminal, which honours 17/19. A terminal that does
+not ignores them and is no worse off than before, so there is nothing to
+detect and nothing to fall back to.
+
 ## Everything is an event, and the main loop only ever waits on the queue
 
 Every source porter reacts to runs on its own thread and *posts* to one
