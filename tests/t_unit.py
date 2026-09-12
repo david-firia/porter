@@ -756,6 +756,64 @@ check("a device already in the list is not an arrival",
       _on_plug([_A], _B, "239a:80f4:AAA"), None)
 
 
+# Losing a device lands in the picker, on the alternate screen, with the log
+# of what the device said on the main one -- out of reach exactly when it is
+# worth reading.  esc with nothing to resume hands that screen back.
+print("the console log is readable with no device connected")
+
+class _Typed:
+    """Bus stand-in that plays scripted events, then ends the loop."""
+    def __init__(self, *events): self.events = list(events)
+    def get(self, timeout):
+        if not self.events:
+            _stop()
+        return self.events.pop(0)
+    def take_rx(self):
+        return b"", 0
+
+painted = []
+typed = _Typed((porter.KEY, b"\r"), (porter.KEY, b"x"), (porter.RX, None),
+               (porter.KEY, b"\x1b"), (porter.KEY, b"\x1b"))
+with mock(porter, "BUS", typed), mock(porter, "w", painted.append):
+    porter.log_view()
+# A terminal with quick-edit on copies the selection with enter.  A view that
+# exists to be copied out of cannot also treat that as a command.
+check("enter and stray keys do not leave the log", len(typed.events), 1)
+check("the hint says how to get back",
+      porter.LOG_HINT in "".join(painted), True)
+check("... and is taken back on the way out", painted[-1],
+      porter.SAVE_CUR + porter.CLEAR_EOL + porter.REST_CUR)
+
+# The screen is still held, so a reader leaked from the session that died
+# cannot scribble over what is being read -- and the signal is re-armed on the
+# way out, like every other loop that owns the screen.
+bus = porter.Bus()
+bus.post_rx(b"leaked reader tail")
+bus.post(porter.KEY, b"\x1b")
+porter.SCREEN.hold()
+with mock(porter, "BUS", bus), mock(porter, "w", _noop):
+    porter.log_view()
+check("output arriving while the log is read is held, not painted into it",
+      porter.SCREEN.release(), b"leaked reader tail")
+bus.post_rx(b"more")
+check("... and the rx signal is re-armed on the way out", bus.get(0.01),
+      (porter.RX, None))
+
+def _picker_esc(resumable):
+    with mock(porter, "_scan_ports", lambda: []), \
+         mock(porter, "BUS", _Typed((porter.KEY, b"\x1b"))), \
+         mock(porter, "w", _noop), mock(porter, "w_bytes", _noop):
+        return porter.picker(configparser.ConfigParser(),
+                             pathlib.Path("nowhere"), {}, None, None,
+                             resumable=resumable)
+
+# esc means "back to the console" either way, and never means quit: that is q.
+check("esc with a session behind it goes back to it",
+      _picker_esc(True) is porter.CANCEL, True)
+check("esc with nothing behind it goes to the log",
+      _picker_esc(False) is porter.LOG, True)
+
+
 print("the screen holds device output while porter owns it")
 
 written = []

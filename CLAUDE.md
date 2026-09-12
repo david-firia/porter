@@ -101,7 +101,9 @@ from an open page cannot quietly overrun `BACKLOG_MAX` and drop output.
 
 **`toast()` — transient, over the session.** Theme and local-echo acks. One
 slot, so repeated presses replace rather than stack; `TOAST_SECS` or any key,
-whichever comes first.
+whichever comes first. `log_view()` borrows the same paint-and-erase
+discipline for its one hint line without being a toast: it has no timeout,
+because it is the whole view rather than an ack.
 
 Two invariants a toast must not break:
 
@@ -414,6 +416,44 @@ picker was up report the disconnect rather than resume, so `esc` still means
 Covered by "the picker takes back the device whose session was lost" in
 `t_unit.py` (including the three cases that must *not* fire) and by the
 unplug/replug cycles in `t_stress.py`.
+
+### esc never quits, and the picker's other exit is the log
+
+`esc` in the picker means **back to the console**, and now means that whether
+or not a session is behind it. With one, it resumes (`CANCEL`). Without one it
+returns `LOG`, and `main` hands the main screen back through `log_view()`
+until `esc` comes again. `q` is the only way out of porter, which is the
+better invariant anyway: the key that means "never mind" should never be the
+key that ends the program.
+
+What makes the view worth having is *when* it is reachable. The log of what a
+device said up to the moment it went is on the main screen; losing the device
+puts the picker on the alternate one, and until something else connects that
+log cannot be read or copied. It is the one moment it is most worth reading.
+
+Three rules hold it together:
+
+- **porter paints nothing into it** beyond one line at the cursor saying how
+  to get back, taken back with the same erase-to-end-of-line a toast uses.
+  This is the real buffer and the point is to select and copy out of it, so
+  scrolling is the terminal's own -- no pager, no reimplementation of a
+  scrollback porter does not own.
+- **Only `esc` leaves.** `enter` above all must not: a terminal with
+  quick-edit on copies the selection with enter, and the one view that exists
+  to be copied out of cannot also treat that as a command. That is a user
+  requirement, not a detail -- it is covered in all three of `t_unit.py`,
+  `t_integ.py` and `t_ui.py`.
+- **Nothing connects itself from here.** A device that arrives is in the list
+  on the way back, where choosing belongs; pulling the screen out from under
+  a selection would not be a favour. For the same reason there is no backstop
+  timeout as `_page()` has: with no session behind it nothing is being kept
+  off the screen, which is also why the picker does not need one.
+
+The screen stays held for the whole visit -- the hold `main` took for the
+picker -- so a reader leaked from the session that died cannot scribble over
+what is being read. It is released on the way round to the picker, which
+takes its own, and what the leaked reader said is flushed into the log like
+any other device output.
 
 ### `GONE` names the session, not the device
 

@@ -1296,6 +1296,13 @@ class _Cancel:
 CANCEL = _Cancel()
 
 
+class _Log:
+    """Sentinel: leave the picker for the console log, with nothing behind it."""
+
+
+LOG = _Log()
+
+
 def _listing(devs) -> set:
     """What the picker has on screen, for deciding whether that is stale.
 
@@ -1374,7 +1381,8 @@ def _render(devs, sel, fresh, msg, cfg_path,
         rows.append(T.muted + " j/k or arrows select  .  enter connect"
                     "  .  1-9 jump  .  b baud  .  a name" + T.reset)
         foot = " h high contrast"
-        foot += "  .  esc resume  .  q quit" if resumable else "  .  q quit"
+        foot += "  .  esc resume" if resumable else "  .  esc log"
+        foot += "  .  q quit"
         rows.append(T.muted + foot + T.reset)
         rows.append(T.muted + f" aliases: {cfg_path}" + T.reset)
 
@@ -1499,9 +1507,11 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                 if key in ("q", "CTRL-C"):
                     return None
                 if key == "ESC":
-                    # Escape means "never mind" when there is a session to go back
-                    # to, and only means quit when there is nothing behind it.
-                    return CANCEL if resumable else None
+                    # Escape means "back to the console" either way: to the
+                    # live session when there is one, and otherwise to the log
+                    # it left behind, which is worth reading precisely when the
+                    # device has gone.  It never means quit -- that is `q`.
+                    return CANCEL if resumable else LOG
                 if key in ("DOWN", "j", "TAB") and devs:
                     sel = (sel + 1) % len(devs)
                     dirty = True
@@ -1571,9 +1581,61 @@ def picker(cfg, cfg_path: Path, overrides: dict, cli_baud: int | None,
                     msg = "reloaded"
                     dirty = True
     finally:
-        # However we leave -- with a device, with CANCEL, or to quit -- the
-        # RX signal is claimed.  One left outstanding is never re-armed, and
-        # the next session's output is never announced.  See _claim_rx().
+        # However we leave -- with a device, with CANCEL, with LOG, or to
+        # quit -- the RX signal is claimed.  One left outstanding is never
+        # re-armed, and the next session's output is never announced.  See
+        # _claim_rx().
+        _claim_rx()
+
+
+LOG_HINT = "console log - esc for the picker"
+
+
+def log_view() -> None:
+    """Hand the main screen back so the log can be read, with no session.
+
+    Losing a device lands in the picker, on the alternate screen -- and
+    everything the device said up to the moment it went is on the main one,
+    out of reach until something else connects.  That is exactly when it is
+    worth reading, and worth copying out of.
+
+    So this is the picker's other exit.  With a session behind it esc already
+    means "back to the console"; with nothing behind it, it used to mean
+    quit.  Now it means the same thing either way, and `q` is the only way
+    out of porter.
+
+    Scrolling is the terminal's own -- this is the real buffer, not a pager --
+    so the wheel and shift-PgUp work as they always do, and porter paints
+    nothing into it beyond one line at the cursor saying how to get back,
+    taken back with the same erase-to-end-of-line a toast uses.  A log that
+    can be copied out of is the whole point; anything porter adds to it is in
+    the way.
+
+    Modal, and *only* esc leaves.  Enter above all must not: a terminal with
+    quick-edit on copies the selection with enter, and a view that exists to
+    be copied out of cannot also treat that as a command.  Nothing connects
+    itself from here either -- a device that arrives is in the list on the
+    way back, which is where choosing belongs.  Pulling the screen out from
+    under a selection would not be a favour.
+
+    The screen stays held, so a reader leaked from the session that died
+    cannot scribble over what is being read.  No backstop timeout, unlike
+    `_page()`: with no session behind it nothing is being kept off the
+    screen, which is the same reason the picker does not need one.
+    """
+    w(WRAP_OFF + SAVE_CUR + T.muted + f"[porter] {LOG_HINT}" + T.reset
+      + REST_CUR + WRAP_ON)
+    try:
+        while True:
+            _beat()
+            kind, payload = BUS.get(POLL)
+            if kind == RX:
+                continue            # held, so nothing to paint: see _claim_rx
+            _claim_rx()
+            if kind == KEY and "ESC" in keys(payload):
+                return
+    finally:
+        w(SAVE_CUR + CLEAR_EOL + REST_CUR)
         _claim_rx()
 
 
@@ -2155,6 +2217,15 @@ def main(argv=None) -> int:
 
                     if choice is CANCEL:
                         current.resume()        # releases the hold, and says so
+                    elif choice is LOG:
+                        # The log is on the main screen and porter is holding
+                        # it: read it there, then round again for the picker,
+                        # which takes its own hold.  Anything a leaked reader
+                        # said meanwhile belongs in that log like any other
+                        # device output.
+                        log_view()
+                        _flush(SCREEN.release())
+                        continue
                     else:
                         SCREEN.release()        # switching or quitting: drop it
                         if choice is None:

@@ -51,12 +51,24 @@ record("aliases path shown", "/tmp/porter_ui_config" in f)
 record("no resume hint without a session", "esc resume" not in f)
 CUR[0] = len(buf)
 
-print("esc with no session quits")
-send("\x1b", 1.0)
-record("still running (esc must not quit... )", proc.poll() is None) if False else None
-# esc with no session should exit
-try: rc0 = proc.wait(timeout=4); record("esc exits when nothing to resume", rc0 == 0, f"rc={rc0}")
-except subprocess.TimeoutExpired: record("esc exits when nothing to resume", False, "still running"); proc.kill()
+print("esc with no session shows the console log")
+record("log hint in the footer", "esc log" in f)
+send("\x1b", 0.6)
+expect("esc hands the screen back rather than quitting", r"console log - esc for the picker")
+record("still running", proc.poll() is None)
+
+# A terminal with quick-edit on copies the selection with enter, so the one
+# view that exists to be copied out of must not treat it as a command.
+n = len(buf)
+send("\r", 0.6)
+record("enter does not leave the log", proc.poll() is None)
+record("... and does not reopen the picker", b"enter connect" not in bytes(buf)[n:])
+
+send("\x1b", 0.6)
+expect("esc goes back to the picker", r"enter connect")
+send("q")
+try: rc0 = proc.wait(timeout=4); record("q still quits", rc0 == 0, f"rc={rc0}")
+except subprocess.TimeoutExpired: record("q still quits", False, "still running"); proc.kill()
 
 # ---- restart for the session tests ----
 master, slave = pty.openpty()

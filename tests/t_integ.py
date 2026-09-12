@@ -201,6 +201,24 @@ ok = proc.poll() is None
 print(("  ok  " if ok else "  FAIL ")+"esc after a loss does not quit porter")
 expect("and lands back in the picker", r"enter connect", timeout=8)
 
+# The log of what the device said right up to the moment it went is on the
+# main screen, out of reach behind the picker -- which is exactly when it is
+# worth reading.  esc with nothing to resume hands that screen back.
+print("the log is readable with the device gone")
+send("\x1b")
+expect("esc opens the log instead of quitting",
+       r"console log - esc for the picker", timeout=5)
+ok = proc.poll() is None
+(oks if ok else fails).append("porter is still running")
+print(("  ok  " if ok else "  FAIL ")+"porter is still running")
+n = mark()
+send("\r")                                        # enter copies, it is not a command
+ok = b"enter connect" not in since(n) and proc.poll() is None
+(oks if ok else fails).append("enter does not leave the log")
+print(("  ok  " if ok else "  FAIL ")+"enter does not leave the log")
+send("\x1b")
+expect("esc goes back to the picker", r"enter connect", timeout=5)
+
 print("quit")
 send("q")
 try: rc = proc.wait(timeout=6)

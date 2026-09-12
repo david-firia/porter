@@ -158,7 +158,7 @@ recognised across replugs even when Windows renumbers it.
    2  jlink-uart             COM7           1366:1051   460800
 
  j/k or arrows select  .  enter connect  .  1-9 jump  .  b baud  .  a name
- h high contrast  .  q quit
+ h high contrast  .  esc log  .  q quit
 ```
 
 - **The list is live.** A device that **just appeared** is tagged `+new` and the
@@ -169,10 +169,14 @@ recognised across replugs even when Windows renumbers it.
 - `a` prompts for a name and saves it as an alias, keyed to the device's USB identity.
   Press `a` on an already-named device to rename it. The config path is shown at the
   bottom of the picker.
-- **`esc` goes back to the session you came from** — the port is never closed while the
-  picker is up, so resuming cannot reset your board, and device output that arrives
-  meanwhile is buffered and flushed when you return. With no session behind it, `esc`
-  exits. `q` always exits.
+- **`esc` goes back to the console.** With a session behind it that means the session:
+  the port is never closed while the picker is up, so resuming cannot reset your board,
+  and device output that arrives meanwhile is buffered and flushed when you return.
+- **With no session behind it, `esc` shows the console log** — the screen the device was
+  talking to, still there after it disconnected. Scroll and select with your terminal's
+  own scrollback; porter adds nothing to it but one line saying how to get back, which
+  is erased on the way out. Only `esc` leaves, so `enter` is free to mean copy. `q` is
+  the only way out of porter.
 - **Losing a device always lands here**, with everything else still plugged in
   visible and selectable — and **the board you just lost is taken back on sight**:
   plug it in again while the picker is up and porter reconnects to it with no
@@ -364,8 +368,9 @@ longer to appear rather than as CPU.
   missing.
 - `tests/t_stress.py` -- repeated unplug/replug cycles, orphan-thread leak check,
   and killing the pty out from under a live reader.
-- `tests/t_ui.py` -- esc-resume with output buffering, alias naming and renaming,
-  non-USB filtering, high-contrast switching.
+- `tests/t_ui.py` -- esc-resume with output buffering, reading the console log with
+  no device connected, alias naming and renaming, non-USB filtering, high-contrast
+  switching.
 
 Needs `socat`.
 
