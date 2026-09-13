@@ -850,6 +850,59 @@ check("esc with nothing behind it goes to the log",
       _picker_esc(False) is porter.LOG, True)
 
 
+print("the tab title names the connection")
+
+# Windows has no TERM and needs none; elsewhere it is an allowlist, because a
+# console that prints an OSC instead of swallowing it puts the title into the
+# session as text -- the one pollution the whole message split exists to stop.
+check("windows takes a title", porter._titles_ok(None), True)
+check("xterm does", porter._titles_ok("xterm-256color"), True)
+check("tmux does", porter._titles_ok("tmux-256color"), True)
+check("the linux console does not", porter._titles_ok("linux"), False)
+check("a dumb terminal does not", porter._titles_ok("dumb"), False)
+check("no TERM at all does not", porter._titles_ok(""), False)
+
+_aliased = porter.Device(port="COM7", key="239a:80f4:X", label="codebot-3",
+                         baud=115200, alias="codebot-3")
+_bare = porter.Device(port="COM7", key="239a:80f4:X", baud=115200,
+                      label="USB Serial Device (COM7)")
+
+check("an aliased device shows the name the user chose",
+      porter.tab_title(_aliased), "codebot-3 on COM7")
+# Never the description: on Windows it is "USB Serial Device (COM7)", which is
+# too long for a tab and is already the port.
+check("without an alias the port is the whole name",
+      porter.tab_title(_bare), "COM7")
+# The port is the one thing about a device that has gone which is no longer
+# true -- it is the same board when it comes back on a different number.
+check("a device that went is named without its port",
+      porter.tab_title(_aliased, lost=True), "codebot-3 disconnected")
+check("... and so is one with no alias to name",
+      porter.tab_title(_bare, lost=True), "COM7 disconnected")
+
+_titles = []
+with mock(porter, "w", _titles.append), mock(porter, "TITLES", True):
+    porter.set_title("codebot-3 on COM7")
+    # A control byte in a driver-supplied description would end the sequence
+    # early and spill the rest of the title onto the screen as text.
+    porter.set_title("evil\x07\x1b]0;gotcha")
+    porter.set_title("x" * 200)
+    porter.set_title()
+check("a title is one OSC 0 sequence", _titles[0], "\x1b]0;codebot-3 on COM7\x07")
+check("a control byte never reaches the wire", _titles[1],
+      "\x1b]0;evil]0;gotcha\x07")
+check("an over-long title is clamped", len(_titles[2]), 64 + 5)
+# Empty is the hand-back: conhost restores the title it started with and
+# Windows Terminal falls back to the profile's own name.
+check("handing it back is the empty title", _titles[3], "\x1b]0;\x07")
+
+_silent = []
+with mock(porter, "w", _silent.append), mock(porter, "TITLES", False):
+    porter.set_title("codebot-3 on COM7")
+    porter.set_title()
+check("a terminal that was not asked gets nothing", _silent, [])
+
+
 print("the screen holds device output while porter owns it")
 
 written = []

@@ -78,7 +78,8 @@ unexplained gap in it is worth less than one that says why the gap is there.
 So the test is not "is this porter talking?" but "does this belong in the
 record?"
 
-Three destinations, in `porter.py`:
+Three destinations, in `porter.py` -- and one thing that is not a destination
+at all, the tab title, below:
 
 | | Use | Reaches the scrollback |
 |---|---|---|
@@ -128,6 +129,75 @@ command key. If that ever reads as laggy against a chatty device, the upgrade
 is a one-row DECSTBM scroll region installed only while the toast is up, so
 output keeps flowing above it. Same call sites, different paint function --
 do not reach for it before the delay is actually a problem.
+
+### The tab title is the connection, not the screen
+
+`set_title()` is the fourth thing porter writes and deliberately not a fourth
+destination: an OSC title reaches no buffer, scrolls nothing, and cannot land
+in a capture of the device's output. It is not part of the record and does not
+want to be — it says what is true *now*, where `note()` says what happened.
+
+It follows the connection and not the screen. The picker, the pages and the
+log view all leave it alone, so a tab still says what it is attached to while
+you are choosing. Three states, and porter sets a title only where a note
+already reports the connection changing:
+
+| | The tab says |
+|---|---|
+| connected | `codebot-3 on COM7`, or `COM7` with no alias |
+| the device went | `codebot-3 disconnected` |
+| nothing open | whatever it said before porter ran |
+
+Four call sites: `Session.open()`, which clears the title on the way *in* so
+that every way an open can fail is covered by one line instead of three; the
+two places `Session.run()` notes a disconnect; and `main`'s `finally`.
+
+**Handing it back is the empty title, and it is not optional.** Same rule as
+the theme's colours -- a title taken and not handed back outlives porter in
+the user's terminal. `\x1b]0;\x07` is how: conhost swaps an empty string for
+`GetOriginalTitle()`, and Windows Terminal resets `_title` so the tab falls
+back to the profile's own name. That is why "nothing is connected" and
+"porter is gone" are the same call, and why porter never writes the string
+`porter` into a title -- an unconnected tab reading "porter (serial)" is the
+fragment profile's name, which is the right answer and costs nothing to keep.
+
+**A device that has gone is named without its port.** The port is the one
+thing about it that is no longer true, and a board that comes back on a
+different COM number is the same board -- the premise porter is built on. The
+name survives the loss; the number does not.
+
+**The description is never the name.** On Windows it is `USB Serial Device
+(COM7)`: too long for a tab, and already the port. An alias is a name the user
+chose, so that is the name; without one the port is all there is.
+
+**The title stays stale for as long as the picker is up over a lost session.**
+The picker marks `session.lost` and says nothing until `esc` resumes into the
+disconnect note. Leaving the title on that same edge is what keeps it to one
+rule; if it ever needs to lead the note, that is a second rule and should be
+written down as one.
+
+### The title is an allowlist, unlike the theme's colours
+
+The colours need no gate: a terminal emulator swallows an OSC it does not
+implement, so there is "nothing to detect and nothing to fall back to". A
+console that is not an emulator need not be so kind. The Linux virtual console
+only grew a state to swallow OSC late; before that it printed the payload as
+text. A title arriving in the session *as characters* is the exact pollution
+the three destinations exist to avoid, so `_TITLE_TERMS` is an allowlist
+rather than a denylist: an unlisted terminal loses a nicety, a wrong guess
+corrupts the log. That asymmetry is the whole argument -- do not turn it round.
+
+Windows is in unconditionally and has no `TERM` to consult: conhost and
+Windows Terminal both take OSC 0 once `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is
+on, which `arm_console()` sets and every sequence porter writes already
+depends on.
+
+None of it is Windows-specific, whatever the Windows Terminal tab suggests.
+It is an xterm sequence; the same call names an xterm window and a tmux pane.
+
+Covered by "the tab title names the connection" in `t_unit.py` and by the
+connect / disconnect / hand-back checks in `t_integ.py`, which pins `TERM`
+rather than inheriting whatever ran the suite.
 
 ## A theme takes every colour on the screen, or none
 

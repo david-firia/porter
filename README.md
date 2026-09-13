@@ -308,6 +308,29 @@ same entry Windows Terminal's own settings UI offers under *Built-in icon*. A
 private-use codepoint there is rendered as a font glyph rather than read as a file
 path, so it needs nothing installed alongside it.
 
+## The tab title
+
+porter names the terminal's title after whatever it is connected to, so a row of
+tabs says which board each one is on rather than three identical "porter"s.
+
+| The tab says | Meaning |
+|---|---|
+| `codebot-3 on COM7` | connected, and you aliased this board `codebot-3` |
+| `COM7` | connected to a board you have not named |
+| `codebot-3 disconnected` | it was unplugged; porter is in the picker waiting for it |
+| `porter (serial)` | nothing is open — the tab is back to the profile's own name |
+
+An unplugged board keeps its name and loses its port, because the port is the one
+thing that may be different when it comes back.
+
+This is the ordinary xterm title sequence, not a Windows feature — it names an
+xterm window or a tmux pane just as well. porter sends it only to terminals known
+to accept it (`TERM` matching `xterm`, `screen`, `tmux`, `vte`, `alacritty`,
+`kitty`, `wezterm` and friends, plus every Windows console), because a terminal
+that does *not* understand it would print it into your session instead, and porter
+would rather lose the title than scribble in the log. The title is handed back
+when porter exits, so the tab returns to whatever it said before.
+
 ## How it stays responsive
 
 Every source porter reacts to runs on its own thread and posts to one queue. The

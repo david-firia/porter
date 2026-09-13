@@ -26,8 +26,11 @@ for _ in range(100):
 master, slave = pty.openpty()
 import termios, struct, fcntl
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+# TERM decides whether porter will set the terminal's title at all, so pin it
+# rather than inherit whatever ran the suite.
 proc = subprocess.Popen([sys.executable, "-u", os.path.join(SCRATCH,"wrapper.py"), "-c", CFG],
-                        stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+                        stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                        env={**os.environ, "TERM": "xterm-256color"})
 os.close(slave)
 os.set_blocking(master, False)
 
@@ -97,6 +100,9 @@ CURSOR[0] = len(buf)
 print("connect")
 send("\r")
 expect("session banner", r"CircuitPython on /tmp/porter_a @ 115200")
+# The tab says what porter is attached to.  No alias here, so the port is the
+# whole name -- never the description, which is too long for a tab.
+expect("the tab is named for the connection", r"\x1b\]0;/tmp/porter_a\x07")
 
 print("data flow")
 n = mark(); dev_write("hello from device\r\n")
@@ -138,6 +144,9 @@ print("unplug -> the picker")
 n = mark()
 FLAG.unlink()
 expect("disconnect detected", r"CircuitPython disconnected", timeout=8)
+# ... and the tab says so too, across the picker that follows: from another
+# tab that title is the only place porter's wait for this device is visible.
+expect("the tab reports the loss", r"\x1b\]0;/tmp/porter_a disconnected\x07")
 # Losing a device always lands in the picker, which is already a live device
 # monitor -- so whatever else is plugged in stays visible and selectable.
 ok = b"\x1b[?1049h" in since(n)
@@ -220,11 +229,19 @@ send("\x1b")
 expect("esc goes back to the picker", r"enter connect", timeout=5)
 
 print("quit")
+n = mark()
 send("q")
 try: rc = proc.wait(timeout=6)
 except subprocess.TimeoutExpired: proc.kill(); rc = "timeout"
 (oks if rc==0 else fails).append("clean exit")
 print(("  ok  " if rc==0 else "  FAIL ")+f"clean exit (rc={rc})")
+# A title taken and not handed back outlives porter in the user's terminal.
+# The empty one is the hand-back: conhost restores the title it started with,
+# Windows Terminal falls back to the profile's own name.
+pump(0.5)
+ok = b"\x1b]0;\x07" in since(n)
+(oks if ok else fails).append("the tab is handed back on the way out")
+print(("  ok  " if ok else "  FAIL ")+"the tab is handed back on the way out")
 
 for s in socats: s.kill()
 os.close(dev)

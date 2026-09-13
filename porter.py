@@ -549,6 +549,84 @@ def note(text: str, style: str | None = None) -> None:
     w(f"\r\n{T.muted if style is None else style}[porter] {text}{T.reset}\r\n")
 
 
+# --------------------------------------------------------------------------
+# The tab title
+# --------------------------------------------------------------------------
+#
+# OSC 0 sets the terminal's title, which is what Windows Terminal shows on the
+# tab.  An *empty* title is how it is handed back rather than a fourth thing
+# to remember: conhost restores the title it started with, and Windows
+# Terminal drops back to the profile's own name -- so "nothing is connected"
+# and "porter is gone" are the same call, and a tab that said "porter
+# (serial)" before porter ran says it again afterwards.  Same rule as the
+# theme's colours: a title taken and not handed back outlives porter in the
+# user's terminal.
+_TITLE = "\x1b]0;{text}\x07"
+
+# Where it is safe to send one.  The theme's OSC colours need no gate because
+# a terminal emulator that does not implement an OSC swallows it -- but a
+# console that is not an emulator need not.  The Linux virtual console only
+# grew a rule to swallow OSC late; before that it printed the payload as text.
+# A title arriving in the session *as characters* is the exact pollution the
+# three destinations above exist to avoid, so this is an allowlist rather than
+# a denylist: an unlisted terminal loses a nicety, a wrong guess corrupts the
+# log.  Nothing here is Windows-specific -- the title is an xterm sequence
+# that Windows Terminal happens to put on the tab.
+_TITLE_TERMS = ("xterm", "screen", "tmux", "vte", "gnome", "konsole", "rxvt",
+                "alacritty", "kitty", "wezterm", "foot", "contour", "ghostty",
+                "st-", "iterm", "mlterm", "putty")
+
+
+def _titles_ok(term: str | None) -> bool:
+    """Whether this terminal takes an OSC title.
+
+    `term` is None on Windows, which has no TERM and needs none: conhost and
+    Windows Terminal both take OSC 0 once ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    is on, which arm_console() sets and every sequence porter writes already
+    depends on.
+    """
+    return term is None or term.startswith(_TITLE_TERMS)
+
+
+TITLES = _titles_ok(None if WINDOWS else os.environ.get("TERM", ""))
+
+
+def set_title(text: str = "") -> None:
+    """Name the live connection in the terminal's title, or hand it back.
+
+    Not a fourth destination: it reaches no buffer, scrolls nothing and cannot
+    land in a capture of the device's output, so it says what is true *now*
+    rather than what happened.  It tracks the connection and not the screen --
+    the picker, the pages and the log view all leave it alone, so a tab still
+    says what it is attached to while you are choosing.
+
+    Aliases and driver-supplied descriptions both reach this, so the text is
+    clamped: one control byte in a device description would end the sequence
+    early and spill the rest of the title onto the screen as text.
+    """
+    if not TITLES:
+        return
+    w(_TITLE.format(text="".join(c for c in text if c.isprintable())[:64]))
+
+
+def tab_title(dev, lost: bool = False) -> str:
+    """What the tab says about a device.
+
+    The name is the shortest thing that identifies it: the alias if the user
+    gave one, the port otherwise.  The description is not a substitute -- on
+    Windows it is "USB Serial Device (COM7)", which is both too long for a tab
+    and already the port.
+
+    A device that has gone is named *without* its port on purpose.  The port
+    is the one thing about it that is no longer true, and a board that comes
+    back on a different COM number is still the same board.
+    """
+    name = dev.alias or dev.port
+    if lost:
+        return f"{name} disconnected"
+    return f"{name} on {dev.port}" if dev.alias else name
+
+
 def set_theme(name: str) -> None:
     """Switch palette, and tell the terminal which colours to paint with."""
     global T
@@ -1810,6 +1888,11 @@ class Session:
 
     def open(self) -> str | None:
         """Connect.  Returns None on success, or the line to report."""
+        # Nothing is connected until it is, and that covers every way this can
+        # fail without a title call on each of them.  The retry wait inside
+        # _open_port can last seconds, and through all of it the tab is
+        # honestly unattached.
+        set_title()
         ser, err = _open_port(self.dev)
         if ser is None:
             if err is CANCELLED:
@@ -1825,6 +1908,7 @@ class Session:
         self._thread.start()
         note(f"{self.dev.label} on {self.dev.port} @ {self.dev.baud}"
              " - ctrl-t ? for help")
+        set_title(tab_title(self.dev))
         return None
 
     def close(self) -> None:
@@ -1960,6 +2044,7 @@ class Session:
         if self.lost:
             self._paint(time.monotonic())
             note(f"{self.dev.label} disconnected", T.warn)
+            set_title(tab_title(self.dev, lost=True))
             return LOST
 
         reason = QUIT
@@ -2036,6 +2121,10 @@ class Session:
 
         if reason == LOST:
             note(f"{self.dev.label} disconnected", T.warn)
+            # Stays on the tab across the picker that follows: porter is
+            # waiting for this device, and from another tab the title is the
+            # only place that wait is visible.  The next open() clears it.
+            set_title(tab_title(self.dev, lost=True))
         return reason
 
 
@@ -2310,6 +2399,7 @@ def main(argv=None) -> int:
             reader.join(timeout=1.0)
             if current is not None:
                 current.close()
+            set_title()         # hand the tab back, like the colours below
             w(CUR_SHOW + SGR0 + (_OSC_RESET if T.fg else "") + "\r\n")
 
     return 0
