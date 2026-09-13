@@ -5,7 +5,7 @@
             "name": "porter (serial)",
             "commandline": "porter",
             "startingDirectory": "%USERPROFILE%",
-            "icon": "\ud83d\udd0c",
+            "icon": "\uE88E",
             "closeOnExit": "graceful",
             "historySize": 20000
         }

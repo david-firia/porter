@@ -303,6 +303,11 @@ Copy `porter.fragment.json` there as `porter.json`, drop the `$help` key, and se
 directory). A bare `porter` works too, but only once PATH has caught up — which it has
 not if Windows Terminal was already running when you installed.
 
+The profile's `icon` is `\uE88E`, the **USB** glyph from Segoe Fluent Icons — the
+same entry Windows Terminal's own settings UI offers under *Built-in icon*. A
+private-use codepoint there is rendered as a font glyph rather than read as a file
+path, so it needs nothing installed alongside it.
+
 ## How it stays responsive
 
 Every source porter reacts to runs on its own thread and posts to one queue. The
