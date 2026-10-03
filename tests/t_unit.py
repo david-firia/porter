@@ -537,7 +537,7 @@ held = porter.Device(port="COM77", key="k", label="board", baud=115200)
 alive = threading.Event()
 stuck = threading.Thread(target=alive.wait, daemon=True, name="stuck-reader")
 stuck.start()
-porter._LEAKED[held.port] = stuck
+porter._LEAKED[held.port] = (stuck, None)
 
 check("a live leak is reported", porter._holder("COM77") is stuck, True)
 check("an unrelated port is not", porter._holder("COM78"), None)
@@ -553,6 +553,96 @@ check("and still carries the underlying error", "Access is denied" in err, True)
 alive.set(); stuck.join(timeout=2.0)
 check("a leak that lets go is forgotten", porter._holder("COM77"), None)
 check("... and stops being reported", porter._LEAKED.get("COM77"), None)
+
+
+# A held port is a wait with a known cause.  It must not be spent on the
+# driver-settle budget, it must keep cancelling the leaked handle in case the
+# driver comes round, and it must open the moment the reader lets go.
+print("an open waits for a leaked reader to let go")
+
+class _Held:
+    """The leaked handle: counts the cancels aimed at it."""
+    def __init__(self): self.cancels = 0
+    def cancel_read(self): self.cancels += 1
+    def cancel_write(self): pass
+
+class _Port:
+    """serial.Serial stand-in: denied while the leak is alive, then opens."""
+    opened = 0
+    def open(self):
+        if alive_t.is_alive():
+            raise PermissionError("Access is denied")
+        _Port.opened += 1
+
+release = threading.Event()
+alive_t = threading.Thread(target=release.wait, daemon=True, name="stuck-reader")
+alive_t.start()
+leaked = _Held()
+porter._LEAKED["COM77"] = (alive_t, leaked)
+waits, said = [0], []
+
+def _wait(_s):
+    waits[0] += 1
+    if waits[0] == 15:                  # past the 10-attempt settle budget
+        release.set(); alive_t.join(timeout=2.0)
+    return False
+
+with mock(porter, "serial", types.SimpleNamespace(Serial=_Port)),      mock(porter, "_wait_bus", _wait), mock(porter, "note", lambda *a: said.append(a[0])),      mock(porter, "_scan_ports", lambda: [P("COM77")]),      mock(porter, "_identity", lambda _p: "k"):
+    ser, err = porter._open_port(held)
+check("a held port opens once its reader lets go", (err, _Port.opened), (None, 1))
+check("... even past the settle budget", waits[0], 15)
+check("... re-cancelling the leaked handle on every attempt", leaked.cancels, 15)
+check("... and saying once what it waits for", 
+      [m for m in said if "still held" in m].__len__(), 1)
+check("... with no settle-retry chatter", [m for m in said if "opening" in m], [])
+
+release2 = threading.Event()
+alive_t = threading.Thread(target=release2.wait, daemon=True, name="stuck-reader")
+alive_t.start()
+porter._LEAKED["COM77"] = (alive_t, _Held())
+with mock(porter, "serial", types.SimpleNamespace(Serial=_Port)),      mock(porter, "_wait_bus", lambda _s: False), mock(porter, "note", _noop),      mock(porter, "_scan_ports", lambda: [P("COM77")]),      mock(porter, "_identity", lambda _p: "k"), mock(porter, "HELD_WAIT", 0.05):
+    ser, err = porter._open_port(held)
+check("a reader that never lets go is given up on", type(err), PermissionError)
+release2.set(); alive_t.join(timeout=2.0)
+porter._LEAKED.clear()
+
+
+print("a reader that will not stop is cancelled repeatedly, and says where")
+
+class _Deaf:
+    """A handle whose driver ignores cancels until the fifth."""
+    def __init__(self): self.cancels, self.freed = 0, threading.Event()
+    def cancel_read(self):
+        self.cancels += 1
+        if self.cancels >= 5:
+            self.freed.set()
+    def cancel_write(self): pass
+
+sess = porter.Session(held, porter.Bus())
+sess.ser = _Deaf()
+sess._thread = threading.Thread(target=sess.ser.freed.wait, daemon=True)
+sess._thread.start()
+with mock(porter, "note", _noop):
+    sess.close()
+check("close keeps cancelling until the reader stops", sess._thread.is_alive(), False)
+check("... and leaks nothing", porter._LEAKED.get("COM77"), None)
+
+def _wedged():
+    while not never.is_set():
+        time.sleep(0.05)                # a native call, as a driver's would be
+never = threading.Event()
+sess = porter.Session(held, porter.Bus())
+sess.ser = _Held()
+sess._thread = threading.Thread(target=_wedged, daemon=True)
+sess._thread.start()
+said = []
+with mock(porter, "note", lambda *a: said.append(a[0])):
+    sess.close()
+check("a reader that never stops is leaked with its handle",
+      porter._LEAKED["COM77"], (sess._thread, sess.ser))
+check("... and the note says where it is stuck", "in _wedged" in said[-1], True)
+never.set(); sess._thread.join(timeout=2.0)
+porter._LEAKED.clear()
 
 
 # The retry between open attempts is the one stretch with no session and no

@@ -591,9 +591,28 @@ identity: a session ends only on its own reader's fault.
 The reader owns closing its own handle, so one that would not stop keeps the
 port open, and every reopen fails with a bare "access is denied" that reads
 like a broken device. It is not -- it is porter still holding it. `close()`
-records the thread in `_LEAKED`, `_holder()` forgets it once it lets go, and
-the open failure names it. Same rule as the dropped-byte count: a failure that
-says why is worth far more than one that does not.
+records the thread and its handle in `_LEAKED`, `_holder()` forgets it once it
+lets go, and the open failure names it. Same rule as the dropped-byte count: a
+failure that says why is worth far more than one that does not.
+
+Three things keep a leak from being the end of the port:
+
+- **Cancel, and keep cancelling.** pyserial's `cancel_read()` only cancels a
+  read it can see pending, so one cancel can land just before the reader's
+  next `ReadFile` and miss it. `_cancel_io()` repeats every 100ms through
+  `close()`'s 2s, with `CancelIoEx(handle, NULL)` taking the write too. It
+  never closes the handle; only the reader may (see `_read_loop`).
+- **The leak note says where the reader is stuck** (`_stuck_at()`), because
+  wedged in the read and wedged in the close after a fault are different
+  driver bugs, and the next report should say which one it was.
+- **A held port is its own wait.** `_open_port` doesn't spend the settle
+  budget on it or print settle-retry chatter. It says once that it's waiting,
+  re-cancels the leaked handle each attempt, and opens the moment the reader
+  lets go, up to `HELD_WAIT`, and esc still gives up. That's still one
+  attempt, so the picker's one-attempt-per-loss rule is unchanged.
+
+Covered by "an open waits for a leaked reader to let go" and "a reader that
+will not stop is cancelled repeatedly" in `t_unit.py`.
 
 
 ## When adding a command

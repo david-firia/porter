@@ -1764,23 +1764,64 @@ HELP = """\
 """
 
 
-# Readers that would not stop, by port.  The reader owns closing its own
-# handle -- see Session._read_loop -- so a leaked one keeps the port open, and
-# every attempt to reopen it fails with a bare "access is denied" that reads
-# like the device is broken.  It is not: something porter did is still holding
-# it.  A failure that says so is worth far more than one that does not.
+# Readers that would not stop, by port, with the handle each one holds.  The
+# reader owns closing its own handle -- see Session._read_loop -- so a leaked
+# one keeps the port open, and every attempt to reopen it fails with a bare
+# "access is denied" that reads like the device is broken.  It is not:
+# something porter did is still holding it.  A failure that says so is worth
+# far more than one that does not.
 _LEAKED: dict = {}
+HELD_WAIT = 10.0    # how long an open waits for a leaked reader to let go
 
 
 def _holder(port: str):
     """The thread from an earlier session still holding `port`, or None."""
-    thread = _LEAKED.get(port)
+    thread, _ = _LEAKED.get(port, (None, None))
     if thread is None:
         return None
     if not thread.is_alive():
         _LEAKED.pop(port, None)     # it let go; there is nothing to explain
         return None
     return thread
+
+
+def _cancel_io(ser) -> None:
+    """Cancel everything in flight on `ser`'s handle, from any thread.
+
+    pyserial's own cancel_read() only cancels a read it can see pending, so a
+    cancel that lands between the reader's stop check and its ReadFile is a
+    no-op and the read goes ahead.  Repeating this is what closes that window,
+    and CancelIoEx with no OVERLAPPED takes every request on the handle, the
+    write as well as the read.
+
+    Nothing here closes the handle -- see _read_loop for why only the reader
+    may.  If the reader is already inside CloseHandle the value may have been
+    reissued to the next session, and then this cancels *its* read: pyserial
+    reads an aborted request as an empty one, so that costs one empty read.
+    """
+    with contextlib.suppress(Exception):
+        ser.cancel_read()
+    with contextlib.suppress(Exception):
+        ser.cancel_write()
+    handle = getattr(ser, "_port_handle", None)
+    if WINDOWS and handle:
+        with contextlib.suppress(Exception):
+            ctypes.windll.kernel32.CancelIoEx(handle, None)
+
+
+def _stuck_at(thread) -> str:
+    """Where `thread` is, as `file:line in func`, or "" if it cannot be told.
+
+    A reader that would not stop is wedged in one native call, and which one
+    -- the read itself, or the close that follows a fault -- is the whole
+    difference between a driver that drops cancels and one that hangs a
+    close.  Naming it in the leak note means the next report says which.
+    """
+    frame = sys._current_frames().get(thread.ident)
+    if frame is None:
+        return ""
+    return (f"{Path(frame.f_code.co_filename).name}:{frame.f_lineno}"
+            f" in {frame.f_code.co_name}")
 
 
 class _Cancelled:
@@ -1830,12 +1871,20 @@ def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
     routinely beats the driver to the port.  Retry rather than reporting a
     failure the user can only fix by pressing enter again.
 
+    A port a leaked reader still holds is a different wait with a known
+    cause, so it is not spent on the settle budget or reported as one: every
+    attempt re-cancels the leaked handle, porter says once what it is waiting
+    for, and the open goes ahead the moment the reader lets go -- or gives up
+    after HELD_WAIT.
+
     The wait between attempts is on the bus -- see `_wait_bus()`.  Every
     retry porter does automatically has to be interruptible, or the retrying
     is indistinguishable from being stuck.
     """
     last = None
-    for attempt in range(1, attempts + 1):
+    tries = 0               # attempts spent waiting on the driver
+    held_until = None       # deadline for a leaked reader to let go
+    while True:
         try:
             ser = serial.Serial()
             ser.port = dev.port
@@ -1850,10 +1899,24 @@ def _open_port(dev: Device, attempts: int = 10, delay: float = 0.3):
             return ser, None
         except Exception as exc:
             last = exc
-            if attempt == 1:
-                note(f"opening {dev.port} ... (esc to give up)")
-            elif attempt % 3 == 0:
-                note(f"still opening {dev.port} ({attempt}/{attempts}): {exc}")
+            if _holder(dev.port) is not None:
+                _cancel_io(_LEAKED[dev.port][1])
+                now = time.monotonic()
+                if held_until is None:
+                    held_until = now + HELD_WAIT
+                    note(f"{dev.port} is still held by the last session's "
+                         f"reader; waiting up to {HELD_WAIT:.0f}s for it to "
+                         "let go (esc to give up)", T.warn)
+                elif now >= held_until:
+                    break
+            else:
+                tries += 1
+                if tries == 1 and held_until is None:
+                    note(f"opening {dev.port} ... (esc to give up)")
+                elif tries % 3 == 0:
+                    note(f"still opening {dev.port} ({tries}/{attempts}): {exc}")
+                if tries >= attempts:
+                    break
             if _wait_bus(delay):
                 return None, CANCELLED
             # Give up early if the device left again.
@@ -1900,7 +1963,7 @@ class Session:
             if _holder(self.dev.port) is not None:
                 return (f"cannot open {self.dev.port}: {err} - still held by "
                         "this porter's own reader, which did not stop when "
-                        "the device went")
+                        "the device went; restarting porter frees it")
             return f"cannot open {self.dev.port}: {err}"
         self.ser = ser
         self._thread = threading.Thread(target=self._read_loop, daemon=True,
@@ -1913,18 +1976,25 @@ class Session:
 
     def close(self) -> None:
         self._stop.set()
-        with contextlib.suppress(Exception):
-            self.ser.cancel_read()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            if self._thread.is_alive():
-                # Wedged in a native read.  Leaking one handle is strictly
-                # safer than closing it out from under the thread -- and a
-                # thread leaked *blocked* holds no lock and no GIL, which is
-                # the whole reason the empty-read wait below matters.
-                _LEAKED[self.dev.port] = self._thread
-                note(f"serial reader for {self.dev.port} did not stop; "
-                     "leaking that handle", T.warn)
+        if self._thread is None:
+            return
+        # Cancel, then keep cancelling: one cancel can land before the
+        # reader's next ReadFile and miss it -- see _cancel_io().
+        deadline = time.monotonic() + 2.0
+        while self._thread.is_alive() and time.monotonic() < deadline:
+            _cancel_io(self.ser)
+            self._thread.join(timeout=0.1)
+        if self._thread.is_alive():
+            # Wedged in a native call.  Leaking one handle is strictly safer
+            # than closing it out from under the thread -- and a thread leaked
+            # *blocked* holds no lock and no GIL, which is the whole reason
+            # the empty-read wait below matters.  The next open of this port
+            # keeps cancelling it, in case the driver comes round.
+            _LEAKED[self.dev.port] = (self._thread, self.ser)
+            where = _stuck_at(self._thread)
+            note(f"serial reader for {self.dev.port} did not stop"
+                 + (f" (stuck at {where})" if where else "")
+                 + "; leaking that handle", T.warn)
 
     def resume(self) -> None:
         """Come back from the picker, naming the device we returned to.
