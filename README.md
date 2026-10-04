@@ -206,7 +206,7 @@ Borrowed from [tio](https://github.com/tio/tio), so muscle memory transfers both
 | `ctrl-t q` | quit | | `ctrl-t L` | show line states |
 | `ctrl-t d` | **back to device picker** | | `ctrl-t g` | toggle DTR/RTS |
 | `ctrl-t n` | **next device** | | `ctrl-t b` | send break |
-| `ctrl-t l` | clear screen | | `ctrl-t e` | toggle local echo |
+| `ctrl-t l` | clear screen and scrollback | | `ctrl-t e` | toggle local echo |
 | `ctrl-t h` | **high-contrast mode** | | `ctrl-t ctrl-t` | send a literal ctrl-t |
 
 Everything else reaches the device untouched — including `ctrl-c`, which matters when

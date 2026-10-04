@@ -42,6 +42,14 @@ these to a different meaning.**
 | `m` | change input/output character mapping | | | |
 | `o` | toggle output mode | | | |
 
+`l` is tio's key with tio's effect, not tio's bytes. tio sends RIS (`ESC c`),
+and on Windows Terminal and conhost a reset wipes the scrollback as well as
+the screen, so that is what `l` means to most of the people who press it.
+porter sends `CSI 2J` + `CSI 3J` + home (`CLEAR_ALL`) instead, because RIS
+would also take the theme colours, the tab title and every mode porter set.
+Keep ED 2 ahead of ED 3: those terminals implement ED 2 by scrolling the
+screen into the scrollback, so ED 3 first leaves that screenful behind.
+
 Note `t` is **timestamps**, not "send ctrl-t" — that is `ctrl-t ctrl-t`. It is an
 easy one to get wrong from memory.
 

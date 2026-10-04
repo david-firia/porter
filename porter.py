@@ -59,6 +59,14 @@ HOME = CSI + "H"
 CLEAR_EOL = CSI + "K"
 CLEAR_EOS = CSI + "J"
 CLEAR_SCREEN = CSI + "2J" + CSI + "H"
+# ctrl-t l, which also takes the scrollback.  tio sends RIS (ESC c) for it,
+# and on Windows Terminal and conhost a reset wipes the scrollback too -- so
+# that is what tio's `l` means to the people most likely to press it.  RIS
+# would also take porter's theme colours, the tab title and every mode porter
+# set, so ED 3 does just the one thing instead.  It comes *after* ED 2:
+# Windows Terminal and conhost implement ED 2 by scrolling the screen up into
+# the scrollback, and ED 3 first would leave exactly that screenful behind.
+CLEAR_ALL = CSI + "2J" + CSI + "3J" + CSI + "H"
 SAVE_CUR = "\x1b7"
 REST_CUR = "\x1b8"
 WRAP_OFF = CSI + "?7l"
@@ -1759,7 +1767,7 @@ HELP = """\
  ctrl-t q   quit porter            ctrl-t L   show line states
  ctrl-t d   back to device picker  ctrl-t g   toggle DTR/RTS
  ctrl-t n   next device            ctrl-t b   send break
- ctrl-t l   clear screen           ctrl-t e   toggle local echo
+ ctrl-t l   clear scrollback       ctrl-t e   toggle local echo
  ctrl-t h   high-contrast mode     ctrl-t ctrl-t   send literal ctrl-t\
 """
 
@@ -2266,7 +2274,7 @@ def _command(b: int, sess, outgoing: bytearray):
     elif ch == "e":
         return "echo"
     elif ch == "l":
-        w(CLEAR_SCREEN)
+        w(CLEAR_ALL)
     elif ch == "b":
         with contextlib.suppress(OSError, serial.SerialException):
             ser.send_break(0.25)

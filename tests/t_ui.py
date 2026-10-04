@@ -177,6 +177,13 @@ expect("help text", r"ctrl-t d")
 send("\r")
 expect("back to the main buffer", r"\x1b\[\?1049l")
 
+print("ctrl-t l takes the scrollback, not just the screen")
+CUR[0] = start = len(buf)
+send(b"\x14l")
+expect("screen cleared, then scrollback, then home", r"\x1b\[2J\x1b\[3J\x1b\[H")
+record("not tio's RIS, which would take the theme and title with it",
+       b"\x1bc" not in bytes(buf)[start:])
+
 send(b"\x14d"); expect("picker for exit", r"q quit")
 
 send("q")
